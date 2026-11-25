@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Garment Viewer</title>
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 50% 30%, #f8fafc 0%, #e2e8f0 100%);
+      color: #0f172a;
+      overflow: hidden;
+    }
+    .viewer-wrap {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    model-viewer {
+      width: 100%;
+      height: 100%;
+      --poster-color: transparent;
+    }
+    .controls {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(15, 23, 42, 0.84);
+      backdrop-filter: blur(10px);
+      border-radius: 999px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.25);
+      z-index: 10;
+    }
+    .controls button {
+      border: none;
+      background: transparent;
+      color: #e2e8f0;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 7px 14px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .controls button:hover,
+    .controls button.active {
+      background: #38bdf8;
+      color: #0f172a;
+    }
+    .status-banner {
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid #cbd5e1;
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-size: 13px;
+      color: #334155;
+      display: none;
+      max-width: 90vw;
+      text-align: center;
+      z-index: 20;
+    }
+    .status-banner.error {
+      display: block;
+      border-color: #f87171;
+      background: #fef2f2;
+      color: #991b1b;
+    }
+  </style>
+</head>
+<body>
+  <div class="viewer-wrap">
+    <div id="statusBanner" class="status-banner"></div>
+    <model-viewer
+      id="mv"
+      alt="3D Garment on Mannequin"
+      camera-controls
+      touch-action="pan-y"
+      auto-rotate
+      auto-rotate-delay="1200"
+      rotation-per-second="20deg"
+      shadow-intensity="1.0"
+      shadow-softness="0.85"
+      exposure="1.05"
+      camera-orbit="0deg 82deg 110%"
+      min-camera-orbit="auto 35deg 65%"
+      max-camera-orbit="auto 125deg 220%"
+      field-of-view="32deg"
+      interaction-prompt="auto"
+    ></model-viewer>
+
+    <div class="controls">
+      <button onclick="setOrbit('0deg 82deg 110%')">Front</button>
+      <button onclick="setOrbit('180deg 82deg 110%')">Back</button>
+      <button onclick="setOrbit('90deg 82deg 110%')">Side</button>
+      <button id="rotateBtn" class="active" onclick="toggleRotate()">Auto-Rotate</button>
+    </div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const modelUrl = params.get("model");
+    const mv = document.getElementById("mv");
+    const banner = document.getElementById("statusBanner");
+    const rotateBtn = document.getElementById("rotateBtn");
+
+    if (!modelUrl) {
+      banner.className = "status-banner error";
+      banner.textContent = "Missing ?model=<S3_OR_GLB_URL> query parameter.";
+    } else {
+      mv.src = modelUrl;
+      mv.addEventListener("error", () => {
+        banner.className = "status-banner error";
+        banner.textContent = "Failed to load 3D model. Verify the S3 URL is accessible and S3 CORS allows GET requests from this origin.";
+      });
+    }
+
+    function setOrbit(orbit) {
+      mv.autoRotate = false;
+      rotateBtn.classList.remove("active");
+      mv.cameraOrbit = orbit;
+      mv.jumpCameraToGoal();
+    }
+
+    function toggleRotate() {
+      mv.autoRotate = !mv.autoRotate;
+      rotateBtn.classList.toggle("active", mv.autoRotate);
+    }
+  </script>
+</body>
+</html>

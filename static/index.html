@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Mannequin Garment Studio</title>
+  <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 400px 1fr;
+    }
+    @media (max-width: 960px) {
+      body { grid-template-columns: 1fr; }
+      .viewer-panel { min-height: 520px; }
+    }
+    .sidebar {
+      padding: 24px;
+      background: #1e293b;
+      border-right: 1px solid #334155;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      overflow-y: auto;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.45;
+      margin-top: 4px;
+    }
+    .upload-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .drop-card {
+      position: relative;
+      border: 1.5px dashed #475569;
+      border-radius: 12px;
+      background: #0f172a;
+      padding: 12px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      min-height: 150px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      overflow: hidden;
+    }
+    .drop-card:hover { border-color: #38bdf8; background: #131c31; }
+    .drop-card input { display: none; }
+    .drop-card img {
+      max-width: 100%;
+      max-height: 112px;
+      border-radius: 6px;
+      object-fit: contain;
+    }
+    .drop-label { font-size: 12px; font-weight: 600; color: #cbd5e1; }
+    .drop-hint { font-size: 11px; color: #64748b; }
+
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 12px; font-weight: 600; color: #cbd5e1; }
+    .field select, .field input[type="text"] {
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #f8fafc;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      outline: none;
+    }
+    .field select:focus, .field input:focus { border-color: #38bdf8; }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: #cbd5e1;
+      background: #0f172a;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+    }
+    .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #334155;
+      color: #cbd5e1;
+    }
+    .badge.ok { background: #065f46; color: #6ee7b7; }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0ea5e9, #2563eb);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .result-box {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+    }
+    .result-box.visible { display: flex; }
+    .result-box code {
+      background: #1e293b;
+      padding: 6px 8px;
+      border-radius: 6px;
+      word-break: break-all;
+      color: #7dd3fc;
+      font-size: 11px;
+    }
+    .result-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .result-links a {
+      color: #38bdf8;
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .viewer-panel {
+      position: relative;
+      background: radial-gradient(circle at 50% 35%, #f1f5f9 0%, #cbd5e1 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    model-viewer {
+      width: 100%;
+      height: 100%;
+      min-height: 100vh;
+    }
+    .empty-state {
+      position: absolute;
+      text-align: center;
+      color: #334155;
+      pointer-events: none;
+      padding: 24px;
+    }
+    .empty-state h2 { font-size: 18px; margin-bottom: 6px; }
+    .empty-state p { font-size: 13px; color: #475569; }
+
+    .orbit-bar {
+      position: absolute;
+      bottom: 22px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+      gap: 8px;
+      padding: 8px 12px;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(8px);
+      border-radius: 999px;
+    }
+    .orbit-bar.visible { display: flex; }
+    .orbit-bar button {
+      border: none;
+      background: transparent;
+      color: #e2e8f0;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+    .orbit-bar button:hover, .orbit-bar button.active {
+      background: #38bdf8;
+      color: #0f172a;
+    }
+    .error-msg {
+      color: #fca5a5;
+      font-size: 12px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <aside class="sidebar">
+    <div>
+      <h1>3D Mannequin Garment Studio</h1>
+      <p class="subtitle">Upload front &amp; back shirt/t-shirt images to generate a 3D mannequin <code>.glb</code> and push to S3.</p>
+    </div>
+
+    <div class="upload-grid">
+      <label class="drop-card" id="frontCard">
+        <input type="file" id="frontInput" accept="image/*" />
+        <span class="drop-label">Front Image</span>
+        <span class="drop-hint">PNG or JPG</span>
+      </label>
+      <label class="drop-card" id="backCard">
+        <input type="file" id="backInput" accept="image/*" />
+        <span class="drop-label">Back Image</span>
+        <span class="drop-hint">PNG or JPG</span>
+      </label>
+    </div>
+
+    <div class="field">
+      <label for="productId">Product / SKU ID (optional)</label>
+      <input type="text" id="productId" placeholder="e.g. tee-summer-001" />
+    </div>
+
+    <div class="field">
+      <label for="garmentType">Garment Style</label>
+      <select id="garmentType">
+        <option value="tshirt">Crew-Neck T-Shirt</option>
+        <option value="vneck">V-Neck T-Shirt</option>
+        <option value="polo">Polo Shirt</option>
+        <option value="long_sleeve">Long-Sleeve T-Shirt</option>
+        <option value="shirt">Collared Long-Sleeve Shirt</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="mannequinStyle">Mannequin Finish</label>
+      <select id="mannequinStyle">
+        <option value="studio_charcoal">Studio Charcoal</option>
+        <option value="matte_white">Matte White</option>
+        <option value="warm_beige">Warm Beige</option>
+        <option value="matte_black">Matte Black</option>
+      </select>
+    </div>
+
+    <div class="checkbox-row">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="uploadS3" />
+        <span>Upload to S3</span>
+      </label>
+      <span id="s3Badge" class="badge">Checking S3...</span>
+    </div>
+
+    <button id="generateBtn" class="btn-primary">Generate 3D Mannequin</button>
+    <p id="errorMsg" class="error-msg"></p>
+
+    <div id="resultBox" class="result-box">
+      <strong style="color:#6ee7b7;">3D Model Ready</strong>
+      <span id="metaLine"></span>
+      <code id="modelUrlCode"></code>
+      <div class="result-links">
+        <a id="openViewerLink" href="#" target="_blank">Open Embed Viewer ↗</a>
+        <a id="downloadGlbLink" href="#" download>Download .glb ↓</a>
+      </div>
+    </div>
+  </aside>
+
+  <main class="viewer-panel">
+    <div id="emptyState" class="empty-state">
+      <h2>Upload Front &amp; Back Shirt Images</h2>
+      <p>Your 3D mannequin preview will appear here for 360° inspection.</p>
+    </div>
+
+    <model-viewer
+      id="mv"
+      camera-controls
+      auto-rotate
+      auto-rotate-delay="1000"
+      rotation-per-second="22deg"
+      shadow-intensity="1.0"
+      shadow-softness="0.85"
+      exposure="1.05"
+      camera-orbit="0deg 82deg 110%"
+      field-of-view="32deg"
+    ></model-viewer>
+
+    <div id="orbitBar" class="orbit-bar">
+      <button onclick="setOrbit('0deg 82deg 110%')">Front</button>
+      <button onclick="setOrbit('180deg 82deg 110%')">Back</button>
+      <button onclick="setOrbit('90deg 82deg 110%')">Left</button>
+      <button onclick="setOrbit('-90deg 82deg 110%')">Right</button>
+      <button id="rotBtn" class="active" onclick="toggleRotate()">Auto-Rotate</button>
+    </div>
+  </main>
+
+  <script>
+    let frontFile = null;
+    let backFile = null;
+
+    const frontInput = document.getElementById("frontInput");
+    const backInput = document.getElementById("backInput");
+    const frontCard = document.getElementById("frontCard");
+    const backCard = document.getElementById("backCard");
+    const uploadS3Checkbox = document.getElementById("uploadS3");
+    const s3Badge = document.getElementById("s3Badge");
+    const generateBtn = document.getElementById("generateBtn");
+    const errorMsg = document.getElementById("errorMsg");
+    const resultBox = document.getElementById("resultBox");
+    const mv = document.getElementById("mv");
+    const emptyState = document.getElementById("emptyState");
+    const orbitBar = document.getElementById("orbitBar");
+    const rotBtn = document.getElementById("rotBtn");
+
+    fetch("/health")
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.s3_configured) {
+          s3Badge.textContent = `S3: ${data.s3_bucket}`;
+          s3Badge.classList.add("ok");
+          uploadS3Checkbox.checked = true;
+        } else {
+          s3Badge.textContent = "S3 not set (local mode)";
+          uploadS3Checkbox.checked = false;
+        }
+      })
+      .catch(() => {
+        s3Badge.textContent = "Offline";
+      });
+
+    function bindPreview(input, card, setter) {
+      input.addEventListener("change", () => {
+        const file = input.files[0];
+        if (!file) return;
+        setter(file);
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          card.querySelectorAll("img, span").forEach((el) => el.remove());
+          const img = document.createElement("img");
+          img.src = e.target.result;
+          const lbl = document.createElement("span");
+          lbl.className = "drop-label";
+          lbl.textContent = file.name;
+          card.appendChild(img);
+          card.appendChild(lbl);
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    bindPreview(frontInput, frontCard, (f) => (frontFile = f));
+    bindPreview(backInput, backCard, (f) => (backFile = f));
+
+    generateBtn.addEventListener("click", async () => {
+      errorMsg.style.display = "none";
+      if (!frontFile || !backFile) {
+        errorMsg.textContent = "Please upload both Front and Back images first.";
+        errorMsg.style.display = "block";
+        return;
+      }
+
+      generateBtn.disabled = true;
+      generateBtn.textContent = "Generating 3D Mannequin...";
+
+      try {
+        const form = new FormData();
+        form.append("front_image", frontFile);
+        form.append("back_image", backFile);
+        form.append("garment_type", document.getElementById("garmentType").value);
+        form.append("mannequin_style", document.getElementById("mannequinStyle").value);
+        form.append("upload_to_s3", uploadS3Checkbox.checked ? "true" : "false");
+        const pid = document.getElementById("productId").value.trim();
+        if (pid) form.append("product_id", pid);
+
+        const resp = await fetch("/api/garments/generate-3d", { method: "POST", body: form });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Generation failed");
+
+        const displayUrl = data.local_url || data.s3.model_url;
+        mv.src = displayUrl;
+        emptyState.style.display = "none";
+        orbitBar.classList.add("visible");
+
+        const finalUrl = data.s3.uploaded ? data.s3.model_url : `${window.location.origin}${data.local_url}`;
+        document.getElementById("metaLine").textContent = `${data.filename} • ${(data.file_size_bytes / 1024).toFixed(1)} KB`;
+        document.getElementById("modelUrlCode").textContent = finalUrl;
+        document.getElementById("openViewerLink").href = `/viewer?model=${encodeURIComponent(finalUrl)}`;
+        document.getElementById("downloadGlbLink").href = displayUrl;
+        resultBox.classList.add("visible");
+      } catch (err) {
+        errorMsg.textContent = err.message;
+        errorMsg.style.display = "block";
+      } finally {
+        generateBtn.disabled = false;
+        generateBtn.textContent = "Generate 3D Mannequin";
+      }
+    });
+
+    function setOrbit(orbit) {
+      mv.autoRotate = false;
+      rotBtn.classList.remove("active");
+      mv.cameraOrbit = orbit;
+      mv.jumpCameraToGoal();
+    }
+
+    function toggleRotate() {
+      mv.autoRotate = !mv.autoRotate;
+      rotBtn.classList.toggle("active", mv.autoRotate);
+    }
+  </script>
+</body>
+</html>

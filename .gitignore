@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Environment & Secrets
+.env
+.env.local
+
+# Generated 3D models
+output_models/*.glb
+!output_models/.gitkeep
