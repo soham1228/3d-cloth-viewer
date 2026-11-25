@@ -230,6 +230,14 @@
     </div>
 
     <div class="field">
+      <label for="mannequinGender">Mannequin</label>
+      <select id="mannequinGender">
+        <option value="male">Men (Male Mannequin)</option>
+        <option value="female">Women (Female Mannequin)</option>
+      </select>
+    </div>
+
+    <div class="field">
       <label for="mannequinStyle">Mannequin Finish</label>
       <select id="mannequinStyle">
         <option value="studio_charcoal">Studio Charcoal</option>
@@ -361,6 +369,7 @@
         const form = new FormData();
         form.append("front_image", frontFile);
         form.append("back_image", backFile);
+        form.append("mannequin_gender", document.getElementById("mannequinGender").value);
         form.append("mannequin_style", document.getElementById("mannequinStyle").value);
         form.append("upload_to_s3", uploadS3Checkbox.checked ? "true" : "false");
         const pid = document.getElementById("productId").value.trim();

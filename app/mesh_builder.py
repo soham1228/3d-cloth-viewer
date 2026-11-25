@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -12,6 +13,7 @@ from app.texture_processor import build_garment_atlas_with_meta
 
 GarmentType = Literal["tshirt", "vneck", "long_sleeve", "shirt", "polo"]
 MannequinStyle = Literal["studio_charcoal", "matte_white", "warm_beige", "matte_black"]
+MannequinGender = Literal["male", "female"]
 
 MANNEQUIN_COLORS: Dict[str, Tuple[float, float, float, float]] = {
     "studio_charcoal": (0.16, 0.17, 0.19, 1.0),
@@ -20,15 +22,77 @@ MANNEQUIN_COLORS: Dict[str, Tuple[float, float, float, float]] = {
     "matte_black": (0.07, 0.07, 0.08, 1.0),
 }
 
-# Smooth athletic profile control knots (y from -0.22 hip to +0.50 neck)
 _KNOTS_Y = np.array([-0.22, -0.15, -0.04, 0.06, 0.18, 0.28, 0.352, 0.382, 0.408, 0.43, 0.50])
-_KNOTS_RX = np.array([0.152, 0.154, 0.144, 0.140, 0.164, 0.172, 0.168, 0.130, 0.086, 0.054, 0.047])
-_KNOTS_RF = np.array([0.094, 0.095, 0.089, 0.088, 0.112, 0.106, 0.088, 0.076, 0.063, 0.051, 0.047])
-_KNOTS_RB = np.array([0.090, 0.091, 0.085, 0.083, 0.098, 0.095, 0.085, 0.074, 0.062, 0.050, 0.047])
 
-_RX_SPLINE = PchipInterpolator(_KNOTS_Y, _KNOTS_RX, extrapolate=True)
-_RF_SPLINE = PchipInterpolator(_KNOTS_Y, _KNOTS_RF, extrapolate=True)
-_RB_SPLINE = PchipInterpolator(_KNOTS_Y, _KNOTS_RB, extrapolate=True)
+
+@dataclass(frozen=True)
+class _BodyProfile:
+    rx_spline: PchipInterpolator
+    rf_spline: PchipInterpolator
+    rb_spline: PchipInterpolator
+    arm_x_start: float
+    arm_x_span: float
+    arm_r_start: float
+    arm_r_taper: float
+    sleeve_rz: float
+    sleeve_ry: float
+    y_crest: float
+
+
+_BODY_PROFILES: Dict[str, _BodyProfile] = {
+    "male": _BodyProfile(
+        rx_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.152, 0.154, 0.144, 0.140, 0.164, 0.172, 0.168, 0.130, 0.086, 0.054, 0.047]),
+            extrapolate=True,
+        ),
+        rf_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.094, 0.095, 0.089, 0.088, 0.112, 0.106, 0.088, 0.076, 0.063, 0.051, 0.047]),
+            extrapolate=True,
+        ),
+        rb_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.090, 0.091, 0.085, 0.083, 0.098, 0.095, 0.085, 0.074, 0.062, 0.050, 0.047]),
+            extrapolate=True,
+        ),
+        arm_x_start=0.145,
+        arm_x_span=0.098,
+        arm_r_start=0.038,
+        arm_r_taper=0.014,
+        sleeve_rz=0.060,
+        sleeve_ry=0.056,
+        y_crest=0.352,
+    ),
+    "female": _BodyProfile(
+        rx_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.156, 0.152, 0.126, 0.118, 0.145, 0.150, 0.146, 0.115, 0.076, 0.046, 0.041]),
+            extrapolate=True,
+        ),
+        rf_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.096, 0.094, 0.080, 0.078, 0.116, 0.098, 0.082, 0.070, 0.057, 0.045, 0.041]),
+            extrapolate=True,
+        ),
+        rb_spline=PchipInterpolator(
+            _KNOTS_Y,
+            np.array([0.094, 0.092, 0.078, 0.076, 0.092, 0.090, 0.080, 0.068, 0.056, 0.044, 0.041]),
+            extrapolate=True,
+        ),
+        arm_x_start=0.126,
+        arm_x_span=0.088,
+        arm_r_start=0.032,
+        arm_r_taper=0.012,
+        sleeve_rz=0.052,
+        sleeve_ry=0.049,
+        y_crest=0.348,
+    ),
+}
+
+
+def _get_profile(gender: MannequinGender) -> _BodyProfile:
+    return _BODY_PROFILES.get(gender, _BODY_PROFILES["male"])
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray | float) -> np.ndarray | float:
@@ -38,14 +102,16 @@ def _smoothstep(edge0: float, edge1: float, x: np.ndarray | float) -> np.ndarray
 
 def _torso_profile(
     y: np.ndarray,
+    gender: MannequinGender = "male",
     extra_offset: float = 0.0,
     waist_ease: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return C1-smooth anatomical (rx, rz_front, rz_back) across vertical height y."""
+    prof = _get_profile(gender)
     y_clamped = np.clip(y, -0.22, 0.50)
-    rx = _RX_SPLINE(y_clamped)
-    rf = _RF_SPLINE(y_clamped)
-    rb = _RB_SPLINE(y_clamped)
+    rx = prof.rx_spline(y_clamped)
+    rf = prof.rf_spline(y_clamped)
+    rb = prof.rb_spline(y_clamped)
 
     if extra_offset != 0.0 or waist_ease != 0.0:
         ease = extra_offset + waist_ease * np.exp(-((y - 0.0) / 0.16) ** 2)
@@ -56,28 +122,36 @@ def _torso_profile(
     return rx, rf, rb
 
 
-def _neck_half_width(garment_offset: float = 0.015) -> float:
+def _neck_half_width(gender: MannequinGender = "male", garment_offset: float = 0.012) -> float:
     """Exact horizontal radius of the garment torso shell at collar height y=0.422."""
-    return float(_torso_profile(np.array([0.422]), extra_offset=garment_offset)[0][0])
+    return float(_torso_profile(np.array([0.422]), gender=gender, extra_offset=garment_offset)[0][0])
 
 
-def _shoulder_ridge_y(abs_x: np.ndarray, garment_offset: float = 0.015) -> np.ndarray:
-    """Return top shoulder ridge height y from collar edge (0.422) to athletic shoulder crest (0.352)."""
-    x_neck = _neck_half_width(garment_offset)
-    x_crest = float(_torso_profile(np.array([0.352]), extra_offset=garment_offset)[0][0])
+def _shoulder_ridge_y(
+    abs_x: np.ndarray,
+    gender: MannequinGender = "male",
+    garment_offset: float = 0.012,
+) -> np.ndarray:
+    """Return top shoulder ridge height y from collar edge (0.422) to shoulder crest."""
+    y_crest = _get_profile(gender).y_crest
+    x_neck = _neck_half_width(gender=gender, garment_offset=garment_offset)
+    x_crest = float(_torso_profile(np.array([y_crest]), gender=gender, extra_offset=garment_offset)[0][0])
     s = np.clip((abs_x - x_neck) / max(1e-5, x_crest - x_neck), 0.0, 1.0)
-    return 0.422 - 0.070 * (s ** 1.1)
+    return 0.422 - (0.422 - y_crest) * (s ** 1.1)
 
 
 def _eval_torso_x_at_yz(
     side: float,
     y: float,
     z: float,
-    extra_offset: float = 0.015,
-    waist_ease: float = 0.012,
+    gender: MannequinGender = "male",
+    extra_offset: float = 0.0125,
+    waist_ease: float = 0.008,
 ) -> float:
     """Solve exact x on the torso shell for a given (y, z) so sleeve armhole sits flush on torso."""
-    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx_arr, rf_arr, rb_arr = _torso_profile(
+        np.array([y]), gender=gender, extra_offset=extra_offset, waist_ease=waist_ease
+    )
     rx = float(rx_arr[0])
     z_shift = 0.005 * float(np.sin((y - 0.05) * 5.5))
     z_rel = z - z_shift
@@ -95,11 +169,14 @@ def _eval_torso_point(
     x: float,
     y: float,
     is_front: bool,
+    gender: MannequinGender = "male",
     extra_offset: float = 0.0,
     waist_ease: float = 0.0,
 ) -> np.ndarray:
     """Evaluate a point (x, y, z) on the smooth torso/garment super-ellipse shell."""
-    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx_arr, rf_arr, rb_arr = _torso_profile(
+        np.array([y]), gender=gender, extra_offset=extra_offset, waist_ease=waist_ease
+    )
     rx = float(rx_arr[0])
     rz = float(rf_arr[0] if is_front else rb_arr[0])
 
@@ -120,11 +197,14 @@ def _eval_torso_point(
 def _eval_torso_ring(
     y: float,
     theta: np.ndarray,
+    gender: MannequinGender = "male",
     extra_offset: float = 0.0,
     waist_ease: float = 0.0,
 ) -> np.ndarray:
     """Evaluate 3D points (N, 3) on a closed mannequin torso cross-section at height y."""
-    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx_arr, rf_arr, rb_arr = _torso_profile(
+        np.array([y]), gender=gender, extra_offset=extra_offset, waist_ease=waist_ease
+    )
     rx_v = float(rx_arr[0])
     rf_v = float(rf_arr[0])
     rb_v = float(rb_arr[0])
@@ -183,7 +263,6 @@ def _triangulate_grid(
             v01 = r * cols + c_next
             v10 = (r + 1) * cols + c
             v11 = (r + 1) * cols + c_next
-            # Alternate quad diagonal in checkerboard pattern to prevent diagonal shading bands
             use_alt = ((r + c) % 2) == 1
             if flip_winding:
                 if use_alt:
@@ -313,24 +392,25 @@ def _build_tube_along_curve(
     return _merge_primitives(parts, name=name, material_index=material_index)
 
 
-def _arm_centerline(side: float, t_vals: np.ndarray) -> np.ndarray:
+def _arm_centerline(side: float, t_vals: np.ndarray, gender: MannequinGender = "male") -> np.ndarray:
     """Relaxed mannequin arm with subtle outward shoulder curve and forward elbow bend."""
+    prof = _get_profile(gender)
     elbow_bend = np.clip((t_vals - 0.35) / 0.65, 0.0, 1.0)
     return np.column_stack(
         [
-            side * (0.145 + 0.098 * t_vals + 0.008 * np.sin(np.pi * t_vals)),
+            side * (prof.arm_x_start + prof.arm_x_span * t_vals + 0.008 * np.sin(np.pi * t_vals)),
             0.278 - 0.415 * t_vals,
             -0.004 + 0.034 * (elbow_bend ** 1.35),
         ]
     )
 
 
-def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
-    """Build sculpted mannequin torso (tucked cleanly inside shirt hem), neck dome, and arms."""
+def _build_mannequin_body(material_index: int, gender: MannequinGender = "male") -> MeshPrimitiveData:
+    """Build sculpted male or female mannequin torso, neck dome, and arms."""
+    prof = _get_profile(gender)
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
 
-    # Torso ends at y=-0.185 inside garment hem (y=-0.215); sleek neck ends at y=0.495 + 0.028 dome
     ys_body = np.linspace(-0.185, 0.495, 42)
     dome_angles = np.linspace(0.0, np.pi / 2.0, 10)[1:]
     ny = len(ys_body) + len(dome_angles)
@@ -339,7 +419,7 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
     uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
 
     for iy, y in enumerate(ys_body):
-        grid[iy] = _eval_torso_ring(float(y), thetas)
+        grid[iy] = _eval_torso_ring(float(y), thetas, gender=gender)
         uvs[iy, :, 0] = thetas / (2.0 * np.pi)
         uvs[iy, :, 1] = iy / (ny - 1)
 
@@ -347,7 +427,7 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
     base_center_x = float(np.mean(base_ring[:, 0]))
     base_center_z = float(np.mean(base_ring[:, 2]))
     base_y = float(ys_body[-1])
-    dome_height = 0.028
+    dome_height = 0.026
 
     for j, ang in enumerate(dome_angles):
         iy = len(ys_body) + j
@@ -367,9 +447,8 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
     arm_parts = [torso_prim, bottom_cap]
     for side in (-1.0, 1.0):
         t_vals = np.linspace(0.0, 1.0, 26)
-        centers = _arm_centerline(side, t_vals)
-        # Anatomical upper arm -> forearm -> sleek wrist taper
-        radii = 0.038 - 0.014 * t_vals + 0.002 * np.sin(np.pi * t_vals)
+        centers = _arm_centerline(side, t_vals, gender=gender)
+        radii = prof.arm_r_start - prof.arm_r_taper * t_vals + 0.002 * np.sin(np.pi * t_vals)
         radii[-2] *= 0.86
         radii[-1] *= 0.62
         arm_parts.append(
@@ -403,7 +482,13 @@ def _build_stand(material_index: int) -> MeshPrimitiveData:
     return _merge_primitives([pole, base], name="DisplayStand", material_index=material_index)
 
 
-def _collar_y_at_x(abs_x: np.ndarray, is_front: bool, garment_type: GarmentType, neck_half_w: float) -> np.ndarray:
+def _collar_y_at_x(
+    abs_x: np.ndarray,
+    is_front: bool,
+    garment_type: GarmentType,
+    neck_half_w: float,
+    gender: MannequinGender = "male",
+) -> np.ndarray:
     """Compute neckline height inside the neck opening |x| <= neck_half_w."""
     t = np.clip(abs_x / neck_half_w, 0.0, 1.0)
     shoulder_neck_y = 0.422
@@ -417,7 +502,7 @@ def _collar_y_at_x(abs_x: np.ndarray, is_front: bool, garment_type: GarmentType,
         dip_y = 0.335
         return dip_y + (shoulder_neck_y - dip_y) * (t ** 1.65)
     else:
-        dip_y = 0.342
+        dip_y = 0.334 if gender == "female" else 0.342
         return dip_y + (shoulder_neck_y - dip_y) * (t ** 1.85)
 
 
@@ -425,22 +510,23 @@ def _build_garment_torso_half(
     is_front: bool,
     garment_type: GarmentType,
     material_index: int,
+    gender: MannequinGender = "male",
 ) -> MeshPrimitiveData:
-    """Build front or back garment torso+shoulder shell with natural proportions and smooth sides."""
+    """Build front or back garment torso+shoulder shell contoured to male or female mannequin."""
+    prof = _get_profile(gender)
     ny = 52
     nx = 65
     y_bottom = -0.205
     garment_offset = 0.012
     waist_ease = 0.008
-    neck_half_w = _neck_half_width(garment_offset)
+    neck_half_w = _neck_half_width(gender=gender, garment_offset=garment_offset)
 
     thetas_col = np.linspace(-np.pi / 2.0, np.pi / 2.0, nx)
     u_xs = np.sin(thetas_col)
     x_dir = u_xs if is_front else -u_xs
 
-    # Athletic shoulder crest at y=0.352
-    y_crest = 0.352
-    rx_crest = float(_torso_profile(np.array([y_crest]), extra_offset=garment_offset)[0][0])
+    y_crest = prof.y_crest
+    rx_crest = float(_torso_profile(np.array([y_crest]), gender=gender, extra_offset=garment_offset)[0][0])
 
     x_top_target = x_dir * rx_crest
     abs_x_top = np.abs(x_top_target)
@@ -448,8 +534,10 @@ def _build_garment_torso_half(
 
     y_tops = np.where(
         in_neck,
-        _collar_y_at_x(abs_x_top, is_front=is_front, garment_type=garment_type, neck_half_w=neck_half_w),
-        _shoulder_ridge_y(abs_x_top, garment_offset=garment_offset),
+        _collar_y_at_x(
+            abs_x_top, is_front=is_front, garment_type=garment_type, neck_half_w=neck_half_w, gender=gender
+        ),
+        _shoulder_ridge_y(abs_x_top, gender=gender, garment_offset=garment_offset),
     )
 
     grid = np.zeros((ny, nx, 3), dtype=np.float32)
@@ -468,7 +556,9 @@ def _build_garment_torso_half(
 
         for iy, s in enumerate(s_vals):
             y_val = y_bottom + float(s) * (y_top - y_bottom)
-            rx_y = float(_torso_profile(np.array([y_val]), extra_offset=garment_offset, waist_ease=waist_ease)[0][0])
+            rx_y = float(
+                _torso_profile(np.array([y_val]), gender=gender, extra_offset=garment_offset, waist_ease=waist_ease)[0][0]
+            )
 
             if y_val <= y_crest:
                 x_val = xd * rx_y
@@ -482,7 +572,9 @@ def _build_garment_torso_half(
                 else:
                     x_val = float(np.clip(x_val, -rx_y, rx_y))
 
-            pt = _eval_torso_point(x_val, y_val, is_front=is_front, extra_offset=garment_offset, waist_ease=waist_ease)
+            pt = _eval_torso_point(
+                x_val, y_val, is_front=is_front, gender=gender, extra_offset=garment_offset, waist_ease=waist_ease
+            )
             if s < 0.55 and ix not in (0, nx - 1):
                 drape_fade = (1.0 - float(s) / 0.55) ** 1.6
                 drape_z = 0.0020 * float(np.cos(th_col)) * float(np.cos(5.0 * th_col)) * drape_fade
@@ -492,7 +584,6 @@ def _build_garment_torso_half(
 
             grid[iy, ix] = pt
 
-            # Keep center print proportions true to 2D photo while gently wrapping rounded sides
             arc_u = th_col / (np.pi / 2.0)
             x_frac = 0.5 + 0.5 * (0.82 * u_col + 0.18 * arc_u)
             u = u_start + x_frac * (u_end - u_start)
@@ -509,12 +600,16 @@ def _build_garment_torso_half(
     )
 
 
-def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPrimitiveData:
-    """Build smooth ribbed collar band tapering cleanly at shoulder edges (no corner horns)."""
+def _build_collar_trim(
+    garment_type: GarmentType,
+    material_index: int,
+    gender: MannequinGender = "male",
+) -> MeshPrimitiveData:
+    """Build smooth ribbed collar band tapering cleanly at shoulder edges."""
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
     garment_offset = 0.012
-    neck_half_w = _neck_half_width(garment_offset)
+    neck_half_w = _neck_half_width(gender=gender, garment_offset=garment_offset)
 
     collar_h = 0.020 if garment_type in ("shirt", "polo") else 0.012
     ny = 4
@@ -527,7 +622,9 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
         is_front = cos_t >= 0.0
 
         x_rim = sin_t * neck_half_w
-        y_base = float(_collar_y_at_x(np.array([abs(x_rim)]), is_front, garment_type, neck_half_w)[0])
+        y_base = float(
+            _collar_y_at_x(np.array([abs(x_rim)]), is_front, garment_type, neck_half_w, gender=gender)[0]
+        )
         local_h = collar_h * (0.35 + 0.65 * abs(cos_t))
 
         u_sample = 0.25 if is_front else 0.75
@@ -541,9 +638,11 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
             else:
                 y_cur, off = y_base + local_h * 0.50, 0.004
 
-            rx_cur = float(_torso_profile(np.array([y_cur]), extra_offset=off)[0][0])
+            rx_cur = float(_torso_profile(np.array([y_cur]), gender=gender, extra_offset=off)[0][0])
             x_cur = float(np.clip(x_rim, -rx_cur * 0.99, rx_cur * 0.99))
-            pt = _eval_torso_point(x_cur, y_cur, is_front=is_front, extra_offset=off, waist_ease=0.0)
+            pt = _eval_torso_point(
+                x_cur, y_cur, is_front=is_front, gender=gender, extra_offset=off, waist_ease=0.0
+            )
             grid[iy, ix] = pt
             uvs[iy, ix] = [u_sample, 0.12]
 
@@ -551,11 +650,13 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
 
 
 def _build_sleeve(
-    side: float,  # -1.0 = mannequin right (-X), +1.0 = mannequin left (+X)
+    side: float,
     garment_type: GarmentType,
     material_index: int,
+    gender: MannequinGender = "male",
 ) -> MeshPrimitiveData:
-    """Build one garment sleeve flowing strictly outward from the torso armhole (no pinch)."""
+    """Build one garment sleeve anchored flush to the torso shell with upright sleeve UVs."""
+    prof = _get_profile(gender)
     is_long = garment_type in ("long_sleeve", "shirt")
     max_t = 0.88 if is_long else 0.40
 
@@ -564,13 +665,13 @@ def _build_sleeve(
     s_vals = np.linspace(0.0, max_t, ns)
     s_frac = s_vals / max_t
 
-    arm_pts = _arm_centerline(side, s_vals)
+    arm_pts = _arm_centerline(side, s_vals, gender=gender)
     centers = arm_pts.copy()
     centers[:, 0] = arm_pts[:, 0] + side * 0.022 * (1.0 - s_frac)
     centers[:, 1] = arm_pts[:, 1] + 0.016 * (1.0 - s_frac)
 
-    radii_z = (0.060 - 0.006 * s_frac) if not is_long else (0.060 - 0.019 * s_frac)
-    radii_y = (0.056 - 0.006 * s_frac) if not is_long else (0.056 - 0.019 * s_frac)
+    radii_z = (prof.sleeve_rz - 0.006 * s_frac) if not is_long else (prof.sleeve_rz - 0.018 * s_frac)
+    radii_y = (prof.sleeve_ry - 0.006 * s_frac) if not is_long else (prof.sleeve_ry - 0.018 * s_frac)
 
     arm_n, arm_b = [], []
     prev_n = np.array([0.0, 0.0, 1.0])
@@ -626,14 +727,15 @@ def _build_sleeve(
                 radial = np.cos(phi) * (rz * n_vec) + np.sin(phi) * (ry * b_vec)
                 pt_tube = c + radial
 
-                y_seam = float(np.clip(centers[0, 1] + np.sin(phi) * (radii_y[0] * hole_b[1]), 0.220, 0.352))
+                y_seam = float(np.clip(centers[0, 1] + np.sin(phi) * (radii_y[0] * hole_b[1]), 0.220, prof.y_crest))
                 z_seam = float(centers[0, 2] + np.cos(phi) * radii_z[0])
-                x_seam = _eval_torso_x_at_yz(side, y_seam, z_seam, extra_offset=0.0125, waist_ease=0.008)
+                x_seam = _eval_torso_x_at_yz(
+                    side, y_seam, z_seam, gender=gender, extra_offset=0.0125, waist_ease=0.008
+                )
                 pt_seam = np.array([x_seam, y_seam, z_seam], dtype=np.float32)
 
                 grid[is_idx, ip] = (1.0 - w_tube) * pt_seam + w_tube * pt_tube
 
-                # Vertical v runs shoulder -> cuff (0.04 -> 0.96) so hanging sleeve graphics stay upright
                 outer_frac = 0.5 - 0.5 * side * float(np.sin(phi))
                 u = u_inner + outer_frac * (u_outer - u_inner)
                 v = 0.04 + sf * 0.92
@@ -658,7 +760,8 @@ def generate_mannequin_garment_glb(
     back_image_bytes: bytes,
     garment_type: Optional[GarmentType] = None,
     mannequin_style: MannequinStyle = "studio_charcoal",
-    include_stand: bool = True,
+    mannequin_gender: MannequinGender = "male",
+    include_stand: bool = False,
 ) -> bytes:
     """Generate a complete 3D mannequin wearing the uploaded front/back garment as a .glb."""
     atlas_png, is_long_sleeve = build_garment_atlas_with_meta(front_image_bytes, back_image_bytes)
@@ -692,13 +795,17 @@ def generate_mannequin_garment_glb(
         ),
     ]
 
-    mannequin_mesh = _build_mannequin_body(material_index=0)
+    mannequin_mesh = _build_mannequin_body(material_index=0, gender=mannequin_gender)
     garment_parts = [
-        _build_garment_torso_half(is_front=True, garment_type=effective_type, material_index=1),
-        _build_garment_torso_half(is_front=False, garment_type=effective_type, material_index=1),
-        _build_collar_trim(garment_type=effective_type, material_index=1),
-        _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1),
-        _build_sleeve(side=1.0, garment_type=effective_type, material_index=1),
+        _build_garment_torso_half(
+            is_front=True, garment_type=effective_type, material_index=1, gender=mannequin_gender
+        ),
+        _build_garment_torso_half(
+            is_front=False, garment_type=effective_type, material_index=1, gender=mannequin_gender
+        ),
+        _build_collar_trim(garment_type=effective_type, material_index=1, gender=mannequin_gender),
+        _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
+        _build_sleeve(side=1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
     ]
     garment_mesh = _merge_primitives(garment_parts, name="Garment", material_index=1)
 

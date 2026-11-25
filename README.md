@@ -48,7 +48,9 @@ Accepts `multipart/form-data`:
 - `front_image` (file) or `front_image_url` (string)
 - `back_image` (file) or `back_image_url` (string)
 - `product_id` (optional string)
+- `mannequin_gender`: `male` | `female` (default: `male`)
 - `mannequin_style`: `studio_charcoal` | `matte_white` | `warm_beige` | `matte_black`
+- `include_stand`: `false` | `true` (default: `false`)
 - `upload_to_s3`: `true` | `false`
 
 Returns JSON with `s3.model_url` and `viewer_url`.

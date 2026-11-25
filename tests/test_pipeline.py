@@ -90,10 +90,13 @@ def test_atlas_dimensions():
 def test_glb_generation_all_styles():
     front = _make_sample_shirt_png(color=(25, 110, 95), label="FRONT")
     back = _make_sample_shirt_png(color=(25, 110, 95), label="BACK")
-    for gtype in ("tshirt", "vneck", "polo", "long_sleeve", "shirt"):
-        glb = generate_mannequin_garment_glb(front, back, garment_type=gtype)
-        gltf = _validate_glb_bytes(glb)
-        assert len(gltf["meshes"]) == 3  # Mannequin, Garment, DisplayStand
+    for gender in ("male", "female"):
+        for gtype in ("tshirt", "vneck", "polo", "long_sleeve", "shirt"):
+            glb = generate_mannequin_garment_glb(
+                front, back, garment_type=gtype, mannequin_gender=gender
+            )
+            gltf = _validate_glb_bytes(glb)
+            assert len(gltf["meshes"]) == 2  # Mannequin + Garment (no stand pole by default)
 
 
 def test_api_endpoints_and_mocked_s3():

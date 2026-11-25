@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from app.config import settings
-from app.mesh_builder import MannequinStyle, generate_mannequin_garment_glb
+from app.mesh_builder import MannequinGender, MannequinStyle, generate_mannequin_garment_glb
 from app.s3_service import is_s3_configured, upload_glb_to_s3
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -88,8 +88,9 @@ async def generate_3d_garment(
     front_image_url: Optional[str] = Form(default=None),
     back_image_url: Optional[str] = Form(default=None),
     product_id: Optional[str] = Form(default=None),
+    mannequin_gender: MannequinGender = Form(default="male"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
-    include_stand: bool = Form(default=True),
+    include_stand: bool = Form(default=False),
     upload_to_s3: Optional[bool] = Form(default=None),
     save_local: bool = Form(default=True),
 ):
@@ -113,6 +114,7 @@ async def generate_3d_garment(
             front_image_bytes=front_bytes,
             back_image_bytes=back_bytes,
             mannequin_style=mannequin_style,
+            mannequin_gender=mannequin_gender,
             include_stand=include_stand,
         )
     except Exception as exc:
@@ -148,6 +150,7 @@ async def generate_3d_garment(
     return {
         "model_id": safe_id,
         "filename": filename,
+        "mannequin_gender": mannequin_gender,
         "mannequin_style": mannequin_style,
         "file_size_bytes": len(glb_bytes),
         "local_url": local_url,
@@ -160,8 +163,9 @@ async def generate_3d_garment(
 async def generate_3d_garment_raw(
     front_image: UploadFile = File(...),
     back_image: UploadFile = File(...),
+    mannequin_gender: MannequinGender = Form(default="male"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
-    include_stand: bool = Form(default=True),
+    include_stand: bool = Form(default=False),
 ):
     """Return raw .glb binary directly (useful if another backend handles S3 upload itself)."""
     front_bytes = await front_image.read()
@@ -170,6 +174,7 @@ async def generate_3d_garment_raw(
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
         mannequin_style=mannequin_style,
+        mannequin_gender=mannequin_gender,
         include_stand=include_stand,
     )
     return Response(

@@ -19,13 +19,20 @@ def main() -> None:
     parser.add_argument("--front", required=True, type=Path, help="Path to front shirt/t-shirt image.")
     parser.add_argument("--back", required=True, type=Path, help="Path to back shirt/t-shirt image.")
     parser.add_argument(
+        "--gender",
+        dest="mannequin_gender",
+        default="male",
+        choices=["male", "female"],
+        help="Mannequin body shape (default: male).",
+    )
+    parser.add_argument(
         "--mannequin",
         dest="mannequin_style",
         default="studio_charcoal",
         choices=["studio_charcoal", "matte_white", "warm_beige", "matte_black"],
         help="Mannequin surface finish (default: studio_charcoal).",
     )
-    parser.add_argument("--no-stand", action="store_true", help="Omit the display stand base and pole.")
+    parser.add_argument("--with-stand", action="store_true", help="Include a display stand base and pole below.")
     parser.add_argument("--output", "-o", type=Path, default=Path("output_models/garment_3d.glb"), help="Output .glb path.")
     parser.add_argument("--upload-s3", action="store_true", help="Upload the generated .glb to S3 using .env config.")
     parser.add_argument("--s3-name", default=None, help="Filename to use in S3 (defaults to output filename).")
@@ -38,7 +45,8 @@ def main() -> None:
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
         mannequin_style=args.mannequin_style,
-        include_stand=not args.no_stand,
+        mannequin_gender=args.mannequin_gender,
+        include_stand=args.with_stand,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
