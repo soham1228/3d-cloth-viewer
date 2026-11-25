@@ -56,13 +56,39 @@ def _torso_profile(
     return rx, rf, rb
 
 
+def _neck_half_width(garment_offset: float = 0.015) -> float:
+    """Exact horizontal radius of the garment torso shell at collar height y=0.422."""
+    return float(_torso_profile(np.array([0.422]), extra_offset=garment_offset)[0][0])
+
+
 def _shoulder_ridge_y(abs_x: np.ndarray, garment_offset: float = 0.015) -> np.ndarray:
     """Return top shoulder ridge height y for |x| from collar edge to outer shoulder crest."""
-    x_neck = 0.068 + garment_offset
-    x_crest = 0.182 + garment_offset
+    x_neck = _neck_half_width(garment_offset)
+    x_crest = float(_torso_profile(np.array([0.335]), extra_offset=garment_offset)[0][0])
     s = np.clip((abs_x - x_neck) / max(1e-5, x_crest - x_neck), 0.0, 1.0)
-    # Gentle natural shoulder slope from y=0.422 at neck down to y=0.330 at sleeve seam
-    return 0.422 - 0.092 * (s ** 1.15)
+    return 0.422 - 0.087 * (s ** 1.15)
+
+
+def _eval_torso_x_at_yz(
+    side: float,
+    y: float,
+    z: float,
+    extra_offset: float = 0.015,
+    waist_ease: float = 0.012,
+) -> float:
+    """Solve exact x on the torso shell for a given (y, z) so sleeve armhole sits flush on torso."""
+    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx = float(rx_arr[0])
+    z_shift = 0.005 * float(np.sin((y - 0.05) * 5.5))
+    z_rel = z - z_shift
+    rz = float(rf_arr[0] if z_rel >= 0.0 else rb_arr[0])
+
+    shoulder_blend = float(_smoothstep(0.18, 0.335, y)) * (1.0 - float(_smoothstep(0.36, 0.43, y)))
+    pow_exp = 0.94 - 0.08 * shoulder_blend
+    p_inv = 2.0 / pow_exp
+    u_z = min(0.999, abs(z_rel) / max(1e-6, rz))
+    x_mag = rx * (max(0.0, 1.0 - (u_z ** p_inv)) ** (1.0 / p_inv))
+    return float(side * x_mag)
 
 
 def _eval_torso_point(
@@ -397,7 +423,7 @@ def _build_garment_torso_half(
     y_bottom = -0.245
     garment_offset = 0.015
     waist_ease = 0.012
-    neck_half_w = 0.083
+    neck_half_w = _neck_half_width(garment_offset)
 
     # Use sine-spaced columns (angle theta in [-pi/2, +pi/2]) so side curves have uniform arc spacing
     thetas_col = np.linspace(-np.pi / 2.0, np.pi / 2.0, nx)
@@ -445,7 +471,7 @@ def _build_garment_torso_half(
                     if abs(x_val) > rx_y:
                         x_val = np.sign(x_val) * rx_y
                 else:
-                    x_val = float(np.clip(x_val, -rx_y * 0.985, rx_y * 0.985))
+                    x_val = float(np.clip(x_val, -rx_y, rx_y))
 
             pt = _eval_torso_point(x_val, y_val, is_front=is_front, extra_offset=garment_offset, waist_ease=waist_ease)
             if (is_shoulder and iy == ny - 1) or ix == 0 or ix == nx - 1:
@@ -471,11 +497,11 @@ def _build_garment_torso_half(
 
 
 def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPrimitiveData:
-    """Build smooth ribbed collar band using exact torso surface coordinates so zero pinch/horns occur."""
+    """Build smooth ribbed collar band tightly matched to neck_half_w (zero gaps or corners)."""
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
-    neck_half_w = 0.083
     garment_offset = 0.015
+    neck_half_w = _neck_half_width(garment_offset)
 
     collar_h = 0.022 if garment_type in ("shirt", "polo") else 0.014
     ny = 4
@@ -487,7 +513,6 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
         cos_t = float(np.cos(theta))
         is_front = cos_t >= 0.0
 
-        # Match exact x_top at neck rim from _build_garment_torso_half
         x_rim = sin_t * neck_half_w
         y_base = float(_collar_y_at_x(np.array([abs(x_rim)]), is_front, garment_type, neck_half_w)[0])
 
@@ -496,9 +521,9 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
             if iy == 0:
                 y_cur, off = y_base - 0.002, garment_offset
             elif iy == 1:
-                y_cur, off = y_base + collar_h * 0.45, garment_offset + 0.0025
+                y_cur, off = y_base + collar_h * 0.45, garment_offset + 0.002
             elif iy == 2:
-                y_cur, off = y_base + collar_h * 0.85, garment_offset + 0.001
+                y_cur, off = y_base + collar_h * 0.85, garment_offset + 0.0005
             else:
                 y_cur, off = y_base + collar_h * 0.55, 0.004
 
@@ -514,19 +539,18 @@ def _build_sleeve(
     garment_type: GarmentType,
     material_index: int,
 ) -> MeshPrimitiveData:
-    """Build one garment sleeve anchored flush to the shoulder crest with smooth slope continuity."""
+    """Build one garment sleeve whose armhole root sits flush on the torso shell (zero intersection crease)."""
     is_long = garment_type in ("long_sleeve", "shirt")
     max_t = 0.88 if is_long else 0.41
 
-    ns = 22
-    ntheta_half = 20
+    ns = 24
+    ntheta_half = 24
     s_vals = np.linspace(0.0, max_t, ns)
     s_frac = s_vals / max_t
 
     centers = _arm_centerline(side, s_vals)
-    # Match armhole top cleanly to shoulder crest (x=±0.197, y=0.330)
-    radii_z = (0.068 - 0.008 * s_frac) if not is_long else (0.068 - 0.022 * s_frac)
-    radii_y = (0.066 - 0.008 * s_frac) if not is_long else (0.066 - 0.022 * s_frac)
+    radii_z = (0.066 - 0.006 * s_frac) if not is_long else (0.066 - 0.020 * s_frac)
+    radii_y = (0.064 - 0.006 * s_frac) if not is_long else (0.064 - 0.020 * s_frac)
 
     arm_n, arm_b = [], []
     prev_n = np.array([0.0, 0.0, 1.0])
@@ -570,23 +594,26 @@ def _build_sleeve(
             rz = float(radii_z[is_idx])
             ry = float(radii_y[is_idx])
 
-            w_arm = float(_smoothstep(0.0, 0.30, sf))
+            w_arm = float(_smoothstep(0.0, 0.35, sf))
             n_vec = (1.0 - w_arm) * hole_n + w_arm * arm_n[is_idx]
             n_vec = n_vec / max(1e-8, float(np.linalg.norm(n_vec)))
             b_vec = (1.0 - w_arm) * hole_b + w_arm * arm_b[is_idx]
             b_vec = b_vec / max(1e-8, float(np.linalg.norm(b_vec)))
 
+            # Blend from exact torso-surface armhole seam (sf=0) into smooth sleeve tube (sf >= 0.40)
+            w_tube = float(_smoothstep(0.0, 0.40, sf))
+
             for ip, phi in enumerate(phis):
                 radial = np.cos(phi) * (rz * n_vec) + np.sin(phi) * (ry * b_vec)
-                pt = c + radial
-                # Gently tuck upper armhole inside shoulder slope so there is no bumpy shelf
-                if sf < 0.25:
-                    y_rel = float(radial[1])
-                    if y_rel > 0:
-                        blend = 1.0 - sf / 0.25
-                        pt[0] += side * blend * 0.010 * (y_rel / max(1e-4, ry))
-                        pt[1] -= blend * 0.015 * (y_rel / max(1e-4, ry))
-                grid[is_idx, ip] = pt
+                pt_tube = c + radial
+
+                # Compute matching point directly on the torso surface for the armhole seam
+                y_seam = float(np.clip(centers[0, 1] + np.sin(phi) * (radii_y[0] * hole_b[1]), 0.195, 0.335))
+                z_seam = float(np.cos(phi) * radii_z[0])
+                x_seam = _eval_torso_x_at_yz(side, y_seam, z_seam, extra_offset=0.0155, waist_ease=0.012)
+                pt_seam = np.array([x_seam, y_seam, z_seam], dtype=np.float32)
+
+                grid[is_idx, ip] = (1.0 - w_tube) * pt_seam + w_tube * pt_tube
 
                 u = u_shoulder + sf * (u_cuff - u_shoulder)
                 y_dir = float(radial[1] / max(1e-5, float(np.linalg.norm(radial))))
