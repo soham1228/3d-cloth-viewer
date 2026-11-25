@@ -2,7 +2,7 @@
 
 Example usage:
     python generate_3d.py --front front.png --back back.png --output out.glb
-    python generate_3d.py --front front.jpg --back back.jpg --type polo --mannequin matte_white --upload-s3
+    python generate_3d.py --front front.jpg --back back.jpg --mannequin matte_white --upload-s3
 """
 
 from __future__ import annotations
@@ -18,13 +18,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate 3D mannequin .glb from front and back shirt images.")
     parser.add_argument("--front", required=True, type=Path, help="Path to front shirt/t-shirt image.")
     parser.add_argument("--back", required=True, type=Path, help="Path to back shirt/t-shirt image.")
-    parser.add_argument(
-        "--type",
-        dest="garment_type",
-        default="tshirt",
-        choices=["tshirt", "vneck", "long_sleeve", "shirt", "polo"],
-        help="Garment silhouette style (default: tshirt).",
-    )
     parser.add_argument(
         "--mannequin",
         dest="mannequin_style",
@@ -44,7 +37,6 @@ def main() -> None:
     glb_bytes = generate_mannequin_garment_glb(
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
-        garment_type=args.garment_type,
         mannequin_style=args.mannequin_style,
         include_stand=not args.no_stand,
     )

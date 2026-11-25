@@ -230,17 +230,6 @@
     </div>
 
     <div class="field">
-      <label for="garmentType">Garment Style</label>
-      <select id="garmentType">
-        <option value="tshirt">Crew-Neck T-Shirt</option>
-        <option value="vneck">V-Neck T-Shirt</option>
-        <option value="polo">Polo Shirt</option>
-        <option value="long_sleeve">Long-Sleeve T-Shirt</option>
-        <option value="shirt">Collared Long-Sleeve Shirt</option>
-      </select>
-    </div>
-
-    <div class="field">
       <label for="mannequinStyle">Mannequin Finish</label>
       <select id="mannequinStyle">
         <option value="studio_charcoal">Studio Charcoal</option>
@@ -287,15 +276,15 @@
       shadow-intensity="1.0"
       shadow-softness="0.85"
       exposure="1.05"
-      camera-orbit="0deg 82deg 110%"
+      camera-orbit="0deg 82deg 135%"
       field-of-view="32deg"
     ></model-viewer>
 
     <div id="orbitBar" class="orbit-bar">
-      <button onclick="setOrbit('0deg 82deg 110%')">Front</button>
-      <button onclick="setOrbit('180deg 82deg 110%')">Back</button>
-      <button onclick="setOrbit('90deg 82deg 110%')">Left</button>
-      <button onclick="setOrbit('-90deg 82deg 110%')">Right</button>
+      <button onclick="setOrbit('0deg 82deg 135%')">Front</button>
+      <button onclick="setOrbit('180deg 82deg 135%')">Back</button>
+      <button onclick="setOrbit('90deg 82deg 135%')">Left</button>
+      <button onclick="setOrbit('-90deg 82deg 135%')">Right</button>
       <button id="rotBtn" class="active" onclick="toggleRotate()">Auto-Rotate</button>
     </div>
   </main>
@@ -372,7 +361,6 @@
         const form = new FormData();
         form.append("front_image", frontFile);
         form.append("back_image", backFile);
-        form.append("garment_type", document.getElementById("garmentType").value);
         form.append("mannequin_style", document.getElementById("mannequinStyle").value);
         form.append("upload_to_s3", uploadS3Checkbox.checked ? "true" : "false");
         const pid = document.getElementById("productId").value.trim();

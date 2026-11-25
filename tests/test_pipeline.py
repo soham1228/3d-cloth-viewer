@@ -114,14 +114,13 @@ def test_api_endpoints_and_mocked_s3():
         },
         data={
             "product_id": "test-sku-01",
-            "garment_type": "tshirt",
             "mannequin_style": "matte_white",
             "upload_to_s3": "false",
         },
     )
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["filename"] == "test-sku-01_tshirt.glb"
+    assert payload["filename"] == "test-sku-01.glb"
     assert payload["s3"]["uploaded"] is False
 
     # Verify served local .glb
@@ -132,9 +131,9 @@ def test_api_endpoints_and_mocked_s3():
     # Mocked S3 upload
     fake_s3 = S3UploadResult(
         bucket="my-shop-bucket",
-        key="garments/3d-models/test-sku-02_polo.glb",
-        s3_uri="s3://my-shop-bucket/garments/3d-models/test-sku-02_polo.glb",
-        model_url="https://my-shop-bucket.s3.ap-south-1.amazonaws.com/garments/3d-models/test-sku-02_polo.glb",
+        key="garments/3d-models/test-sku-02.glb",
+        s3_uri="s3://my-shop-bucket/garments/3d-models/test-sku-02.glb",
+        model_url="https://my-shop-bucket.s3.ap-south-1.amazonaws.com/garments/3d-models/test-sku-02.glb",
     )
     with patch("app.main.upload_glb_to_s3", return_value=fake_s3) as mock_up:
         resp_s3 = client.post(
@@ -145,7 +144,6 @@ def test_api_endpoints_and_mocked_s3():
             },
             data={
                 "product_id": "test-sku-02",
-                "garment_type": "polo",
                 "upload_to_s3": "true",
             },
         )

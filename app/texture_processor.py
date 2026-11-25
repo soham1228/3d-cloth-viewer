@@ -243,6 +243,13 @@ def _extract_clean_sleeve_patch(
                 break
 
     if best_patch is not None and best_size >= 8:
+        # Match mean sleeve brightness/tone to adjacent shoulder fabric so the armhole seam blends smoothly
+        if np.sum(fallback_mask > 0) > 16:
+            fb_mean = fallback_rgb[fallback_mask > 0].mean(axis=0)
+            patch_mean = np.maximum(1.0, best_patch.mean(axis=(0, 1)))
+            gain = np.clip(fb_mean / patch_mean, 0.75, 1.35)
+            best_patch = np.clip(best_patch.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
         # Build seamless 2x2 mirrored tile, then repeat at natural fabric scale instead of stretching 40x
         h_flip = np.concatenate([best_patch, best_patch[:, ::-1]], axis=1)
         tile_2x2 = np.concatenate([h_flip, h_flip[::-1, :]], axis=0)

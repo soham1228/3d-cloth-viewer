@@ -38,7 +38,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 3. **Or run as a standalone Python script**:
 
 ```bash
-python generate_3d.py --front path/to/front.png --back path/to/back.png --type tshirt --output out.glb --upload-s3
+python generate_3d.py --front path/to/front.png --back path/to/back.png --output out.glb --upload-s3
 ```
 
 ## API Endpoints
@@ -48,7 +48,6 @@ Accepts `multipart/form-data`:
 - `front_image` (file) or `front_image_url` (string)
 - `back_image` (file) or `back_image_url` (string)
 - `product_id` (optional string)
-- `garment_type`: `tshirt` | `vneck` | `polo` | `long_sleeve` | `shirt`
 - `mannequin_style`: `studio_charcoal` | `matte_white` | `warm_beige` | `matte_black`
 - `upload_to_s3`: `true` | `false`
 

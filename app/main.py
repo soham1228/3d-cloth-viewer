@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from app.config import settings
-from app.mesh_builder import GarmentType, MannequinStyle, generate_mannequin_garment_glb
+from app.mesh_builder import MannequinStyle, generate_mannequin_garment_glb
 from app.s3_service import is_s3_configured, upload_glb_to_s3
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -88,7 +88,6 @@ async def generate_3d_garment(
     front_image_url: Optional[str] = Form(default=None),
     back_image_url: Optional[str] = Form(default=None),
     product_id: Optional[str] = Form(default=None),
-    garment_type: GarmentType = Form(default="tshirt"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
     include_stand: bool = Form(default=True),
     upload_to_s3: Optional[bool] = Form(default=None),
@@ -113,7 +112,6 @@ async def generate_3d_garment(
         glb_bytes = generate_mannequin_garment_glb(
             front_image_bytes=front_bytes,
             back_image_bytes=back_bytes,
-            garment_type=garment_type,
             mannequin_style=mannequin_style,
             include_stand=include_stand,
         )
@@ -122,7 +120,7 @@ async def generate_3d_garment(
 
     model_id = (product_id or uuid.uuid4().hex[:12]).strip()
     safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in model_id)
-    filename = f"{safe_id}_{garment_type}.glb"
+    filename = f"{safe_id}.glb"
 
     local_url: Optional[str] = None
     if save_local:
@@ -150,7 +148,6 @@ async def generate_3d_garment(
     return {
         "model_id": safe_id,
         "filename": filename,
-        "garment_type": garment_type,
         "mannequin_style": mannequin_style,
         "file_size_bytes": len(glb_bytes),
         "local_url": local_url,
@@ -163,7 +160,6 @@ async def generate_3d_garment(
 async def generate_3d_garment_raw(
     front_image: UploadFile = File(...),
     back_image: UploadFile = File(...),
-    garment_type: GarmentType = Form(default="tshirt"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
     include_stand: bool = Form(default=True),
 ):
@@ -173,12 +169,11 @@ async def generate_3d_garment_raw(
     glb_bytes = generate_mannequin_garment_glb(
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
-        garment_type=garment_type,
         mannequin_style=mannequin_style,
         include_stand=include_stand,
     )
     return Response(
         content=glb_bytes,
         media_type="model/gltf-binary",
-        headers={"Content-Disposition": f'attachment; filename="garment_{garment_type}.glb"'},
+        headers={"Content-Disposition": 'attachment; filename="garment.glb"'},
     )
