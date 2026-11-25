@@ -55,6 +55,7 @@ class ExtractedGarment:
     torso_x_range: Tuple[int, int]  # (x_left, x_right) in cropped image coordinates
     dominant_color: Tuple[int, int, int]  # RGB
     is_long_sleeve: bool = False
+    from_human: bool = False
 
 
 def _load_image_rgba(image_bytes: bytes) -> np.ndarray:
@@ -63,8 +64,86 @@ def _load_image_rgba(image_bytes: bytes) -> np.ndarray:
     return np.array(pil_img, dtype=np.uint8)
 
 
+def _segment_worn_silhouette_fallback(
+    rgb: np.ndarray,
+    person_mask: np.ndarray,
+) -> Optional[Tuple[np.ndarray, Tuple[int, int], bool]]:
+    """Fallback human-garment isolator using SelfieSegmentation width profile + GrabCut.
+
+    Used when MediaPipe Pose misses a back-facing or 3/4-turned model photo.
+    """
+    h, w = rgb.shape[:2]
+    ys_p, xs_p = np.where(person_mask)
+    if len(ys_p) < h * w * 0.08:
+        return None
+
+    y_top_p = int(ys_p.min())
+    row_widths = person_mask.sum(axis=1)
+
+    # Locate widest torso band in middle 25%..75% of image height
+    mid_y0 = max(y_top_p + int(h * 0.12), int(h * 0.25))
+    mid_y1 = min(h - 1, int(h * 0.80))
+    if mid_y1 <= mid_y0 + 10:
+        return None
+
+    torso_y_peak = mid_y0 + int(np.argmax(row_widths[mid_y0:mid_y1]))
+    max_w = int(row_widths[torso_y_peak])
+    if max_w < w * 0.20:
+        return None
+
+    # Find neck constriction (narrowest width between head top and torso peak)
+    search_y0 = y_top_p + max(4, int((torso_y_peak - y_top_p) * 0.25))
+    search_y1 = max(search_y0 + 2, torso_y_peak - max(4, int((torso_y_peak - y_top_p) * 0.15)))
+    neck_y = search_y0 + int(np.argmin(row_widths[search_y0:search_y1]))
+    neck_w = int(row_widths[neck_y])
+
+    # Collar sits slightly below neck notch
+    y_collar_top = min(torso_y_peak - 5, neck_y + max(4, int(max_w * 0.06)))
+    if neck_w > max_w * 0.68:
+        y_collar_top = y_top_p + int(max_w * 0.36)
+
+    y_pants = min(h, int(y_collar_top + max_w * 1.15))
+
+    torso_row_xs = np.where(person_mask[torso_y_peak] > 0)[0]
+    tx_center = 0.5 * (int(torso_row_xs[0]) + int(torso_row_xs[-1]))
+
+    gc = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    gc[~person_mask] = cv2.GC_BGD
+    gc[:y_collar_top, :] = cv2.GC_BGD
+    if y_pants < h:
+        gc[y_pants:, :] = cv2.GC_BGD
+
+    upper = person_mask.copy()
+    upper[:y_collar_top, :] = False
+    upper[y_pants:, :] = False
+    gc[upper] = cv2.GC_PR_FGD
+
+    # Definite foreground: central chest/back rectangle
+    cx0 = max(0, int(tx_center - max_w * 0.22))
+    cx1 = min(w, int(tx_center + max_w * 0.22))
+    cy0 = min(h - 2, int(y_collar_top + max_w * 0.16))
+    cy1 = min(h - 1, int(y_pants - max_w * 0.18))
+    if cx1 > cx0 and cy1 > cy0:
+        gc[cy0:cy1, cx0:cx1] = cv2.GC_FGD
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    cv2.grabCut(bgr, gc, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+
+    garment_mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    garment_mask = _clean_mask(garment_mask)
+    if np.sum(garment_mask > 0) < h * w * 0.04:
+        return None
+
+    raw_tx0 = max(0, int(tx_center - max_w * 0.30))
+    raw_tx1 = min(w - 1, int(tx_center + max_w * 0.30))
+    return garment_mask, (raw_tx0, raw_tx1), False
+
+
 def _try_segment_worn_garment(
     rgb: np.ndarray,
+    expect_human: bool = False,
 ) -> Optional[Tuple[np.ndarray, Tuple[int, int], bool]]:
     """Detect if a human model is wearing the shirt; if so, isolate only the garment.
 
@@ -76,22 +155,38 @@ def _try_segment_worn_garment(
 
     with _MP_LOCK:
         pose_res = pose.process(rgb)
-        if not pose_res.pose_landmarks:
-            return None
-        lm = pose_res.pose_landmarks.landmark
-        # Require visible shoulders (11, 12) and hips (23, 24)
-        if min(lm[11].visibility, lm[12].visibility, lm[23].visibility, lm[24].visibility) < 0.65:
-            return None
-
-        y_sh_norm = 0.5 * (lm[11].y + lm[12].y)
-        y_hip_norm = 0.5 * (lm[23].y + lm[24].y)
-        torso_h_norm = y_hip_norm - y_sh_norm
-        sh_w_norm = abs(lm[11].x - lm[12].x)
-        if torso_h_norm < 0.14 or sh_w_norm < 0.12:
-            return None
-
         seg_res = seg.process(rgb)
         person_mask = seg_res.segmentation_mask > 0.45
+
+    if not pose_res.pose_landmarks:
+        if expect_human:
+            return _segment_worn_silhouette_fallback(rgb, person_mask)
+        return None
+
+    lm = pose_res.pose_landmarks.landmark
+    # Relax visibility threshold for back-facing / 3/4 poses; estimate hips if occluded
+    if min(lm[11].visibility, lm[12].visibility) < 0.30:
+        if expect_human:
+            return _segment_worn_silhouette_fallback(rgb, person_mask)
+        return None
+
+    y_sh_norm = 0.5 * (lm[11].y + lm[12].y)
+    sh_w_norm = abs(lm[11].x - lm[12].x)
+    if sh_w_norm < 0.10:
+        if expect_human:
+            return _segment_worn_silhouette_fallback(rgb, person_mask)
+        return None
+
+    if min(lm[23].visibility, lm[24].visibility) >= 0.30:
+        y_hip_norm = 0.5 * (lm[23].y + lm[24].y)
+    else:
+        y_hip_norm = min(0.92, y_sh_norm + 1.18 * sh_w_norm)
+
+    torso_h_norm = y_hip_norm - y_sh_norm
+    if torso_h_norm < 0.12:
+        if expect_human:
+            return _segment_worn_silhouette_fallback(rgb, person_mask)
+        return None
 
     y_sh = y_sh_norm * h
     y_hip = y_hip_norm * h
@@ -100,18 +195,24 @@ def _try_segment_worn_garment(
     x_sh_r = max(lm[11].x, lm[12].x) * w
     sh_w = x_sh_r - x_sh_l
 
-    # Confirm a head/neck region is actually present so flat-lay shirts never trigger this
-    head_y0 = max(0, int(y_sh - 0.55 * torso_h))
-    head_y1 = max(head_y0 + 1, int(y_sh - 0.14 * torso_h))
-    head_box = person_mask[head_y0:head_y1, max(0, int(x_sh_l)):min(w, int(x_sh_r))]
-    has_face = lm[0].visibility > 0.65 and lm[0].y < y_sh_norm - 0.04
-    has_ears = lm[7].visibility > 0.60 and lm[8].visibility > 0.60 and min(lm[7].y, lm[8].y) < y_sh_norm
-    has_head_fg = head_box.size > 0 and float(np.mean(head_box)) > 0.18
-    if not (has_face or has_ears or has_head_fg):
-        return None
+    # Confirm a head/neck region is actually present (unless paired front photo already proved human)
+    if not expect_human:
+        head_y0 = max(0, int(y_sh - 0.55 * torso_h))
+        head_y1 = max(head_y0 + 1, int(y_sh - 0.12 * torso_h))
+        head_box = person_mask[head_y0:head_y1, max(0, int(x_sh_l)):min(w, int(x_sh_r))]
+        has_face = lm[0].visibility > 0.55 and lm[0].y < y_sh_norm - 0.04
+        has_ears = (lm[7].visibility > 0.45 or lm[8].visibility > 0.45) and min(lm[7].y, lm[8].y) < y_sh_norm
+        has_head_fg = head_box.size > 0 and float(np.mean(head_box)) > 0.14
+        if not (has_face or has_ears or has_head_fg):
+            return None
 
     # Build GrabCut seed mask: eliminate background, head/neck skin, hands, and jeans
     y_collar_top = max(0, int(y_sh - 0.14 * torso_h))
+    ear_ys = [lm[idx].y for idx in (7, 8) if lm[idx].visibility > 0.40 and lm[idx].y < y_sh_norm]
+    if ear_ys:
+        y_collar_top = max(y_collar_top, int(max(ear_ys) * h + 0.03 * torso_h))
+    y_collar_top = min(int(y_sh), y_collar_top)
+
     y_pants = min(h, int(y_hip + 0.14 * torso_h))
 
     gc = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
@@ -134,7 +235,7 @@ def _try_segment_worn_garment(
         gc[cy0:cy1, cx0:cx1] = cv2.GC_FGD
 
     for sh_i, el_i in ((11, 13), (12, 14)):
-        if lm[el_i].visibility > 0.5:
+        if lm[el_i].visibility > 0.40:
             p1 = (int(np.clip(lm[sh_i].x * w, 0, w - 1)), int(np.clip(lm[sh_i].y * h, 0, h - 1)))
             p2 = (int(np.clip(lm[el_i].x * w, 0, w - 1)), int(np.clip(lm[el_i].y * h, 0, h - 1)))
             cv2.line(gc, p1, p2, int(cv2.GC_FGD), max(6, int(w * 0.04)))
@@ -143,13 +244,13 @@ def _try_segment_worn_garment(
     neck_zone = np.zeros((h, w), dtype=bool)
     ny0 = y_collar_top
     ny1 = min(h, int(y_sh + 0.11 * torso_h))
-    nx0 = max(0, int(x_sh_l + 0.24 * sh_w))
-    nx1 = min(w, int(x_sh_r - 0.24 * sh_w))
+    nx0 = max(0, int(x_sh_l + 0.22 * sh_w))
+    nx1 = min(w, int(x_sh_r - 0.22 * sh_w))
     if ny1 > ny0 and nx1 > nx0:
         neck_zone[ny0:ny1, nx0:nx1] = True
 
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    if lm[0].visibility > 0.65 and lm[0].y < y_sh_norm:
+    if lm[0].visibility > 0.55 and lm[0].y < y_sh_norm:
         fx = int(np.clip(lm[0].x * w, 0, w - 1))
         fy = int(np.clip(lm[0].y * h, 0, h - 1))
         rf = max(5, int(sh_w * 0.06))
@@ -162,7 +263,7 @@ def _try_segment_worn_garment(
             gc[neck_zone & (skin_dist < 28.0)] = cv2.GC_BGD
 
             for wr_i in (15, 16):
-                if lm[wr_i].visibility > 0.45:
+                if lm[wr_i].visibility > 0.40:
                     wx = int(np.clip(lm[wr_i].x * w, 0, w - 1))
                     wy = int(np.clip(lm[wr_i].y * h, 0, h - 1))
                     wr_mask = np.zeros((h, w), dtype=bool)
@@ -170,7 +271,6 @@ def _try_segment_worn_garment(
                     wr_mask[max(0, wy - rw):min(h, wy + rw), max(0, wx - rw):min(w, wx + rw)] = True
                     gc[wr_mask & (skin_dist < 24.0)] = cv2.GC_BGD
     else:
-        # Back view: detect skin in neck zone using YCrCb bounds
         ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
         cr = ycrcb[:, :, 1]
         cb = ycrcb[:, :, 2]
@@ -184,12 +284,13 @@ def _try_segment_worn_garment(
     garment_mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
     garment_mask = _clean_mask(garment_mask)
     if np.sum(garment_mask > 0) < h * w * 0.04:
+        if expect_human:
+            return _segment_worn_silhouette_fallback(rgb, person_mask)
         return None
 
-    # Auto-detect long sleeve vs short sleeve from forearm garment coverage
     forearm_covs = []
     for el_i, wr_i in ((13, 15), (14, 16)):
-        if lm[el_i].visibility > 0.5 and lm[wr_i].visibility > 0.4:
+        if lm[el_i].visibility > 0.40 and lm[wr_i].visibility > 0.35:
             hits = 0
             samples = 20
             for t in np.linspace(0.20, 0.85, samples):
@@ -200,7 +301,6 @@ def _try_segment_worn_garment(
             forearm_covs.append(hits / samples)
     is_long_sleeve = bool(forearm_covs and max(forearm_covs) >= 0.45)
 
-    # Torso X bounds from shoulder landmarks (separates torso from hanging arms)
     raw_tx0 = max(0, int(x_sh_l - 0.03 * sh_w))
     raw_tx1 = min(w - 1, int(x_sh_r + 0.03 * sh_w))
     return garment_mask, (raw_tx0, raw_tx1), is_long_sleeve
@@ -319,7 +419,7 @@ def _estimate_torso_bounds(mask: np.ndarray) -> Tuple[int, int]:
     return max(0, torso_left), min(w - 1, torso_right)
 
 
-def extract_garment(image_bytes: bytes) -> ExtractedGarment:
+def extract_garment(image_bytes: bytes, expect_human: bool = False) -> ExtractedGarment:
     """Segment, tight-crop, and analyze an uploaded garment image (flat-lay or human-worn)."""
     rgba = _load_image_rgba(image_bytes)
     rgb_full = rgba[:, :, :3]
@@ -327,8 +427,9 @@ def extract_garment(image_bytes: bytes) -> ExtractedGarment:
     worn_result = None
     transparent_ratio = float(np.mean(rgba[:, :, 3] < 220))
     if transparent_ratio <= 0.03:
-        worn_result = _try_segment_worn_garment(rgb_full)
+        worn_result = _try_segment_worn_garment(rgb_full, expect_human=expect_human)
 
+    from_human = worn_result is not None
     if worn_result is not None:
         mask, raw_torso_bounds, is_long_sleeve = worn_result
     else:
@@ -382,6 +483,7 @@ def extract_garment(image_bytes: bytes) -> ExtractedGarment:
         torso_x_range=torso_bounds,
         dominant_color=dominant_color,
         is_long_sleeve=is_long_sleeve,
+        from_human=from_human,
     )
 
 
@@ -496,9 +598,14 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
 def build_garment_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tuple[bytes, bool]:
     """Build a 2048x1024 PNG atlas and return (png_bytes, is_long_sleeve)."""
     front = extract_garment(front_bytes)
-    back = extract_garment(back_bytes)
+    back = extract_garment(back_bytes, expect_human=front.from_human)
+    if back.from_human and not front.from_human:
+        front = extract_garment(front_bytes, expect_human=True)
 
     is_long_sleeve = front.is_long_sleeve or back.is_long_sleeve
+    if is_long_sleeve:
+        front.is_long_sleeve = True
+        back.is_long_sleeve = True
     front_tile = _pack_garment_tile(front, HALF_SIZE)
     back_tile = _pack_garment_tile(back, HALF_SIZE)
 
