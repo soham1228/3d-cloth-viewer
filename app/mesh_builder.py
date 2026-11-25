@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from app.glb_writer import MaterialSpec, MeshPrimitiveData, write_glb
-from app.texture_processor import build_garment_atlas
+from app.texture_processor import build_garment_atlas_with_meta
 
 GarmentType = Literal["tshirt", "vneck", "long_sleeve", "shirt", "polo"]
 MannequinStyle = Literal["studio_charcoal", "matte_white", "warm_beige", "matte_black"]
@@ -655,12 +655,13 @@ def _build_sleeve(
 def generate_mannequin_garment_glb(
     front_image_bytes: bytes,
     back_image_bytes: bytes,
-    garment_type: GarmentType = "tshirt",
+    garment_type: Optional[GarmentType] = None,
     mannequin_style: MannequinStyle = "studio_charcoal",
     include_stand: bool = True,
 ) -> bytes:
     """Generate a complete 3D mannequin wearing the uploaded front/back garment as a .glb."""
-    atlas_png = build_garment_atlas(front_image_bytes, back_image_bytes)
+    atlas_png, is_long_sleeve = build_garment_atlas_with_meta(front_image_bytes, back_image_bytes)
+    effective_type: GarmentType = garment_type or ("long_sleeve" if is_long_sleeve else "tshirt")
     mannequin_rgba = MANNEQUIN_COLORS.get(mannequin_style, MANNEQUIN_COLORS["studio_charcoal"])
 
     materials = [
@@ -692,11 +693,11 @@ def generate_mannequin_garment_glb(
 
     mannequin_mesh = _build_mannequin_body(material_index=0)
     garment_parts = [
-        _build_garment_torso_half(is_front=True, garment_type=garment_type, material_index=1),
-        _build_garment_torso_half(is_front=False, garment_type=garment_type, material_index=1),
-        _build_collar_trim(garment_type=garment_type, material_index=1),
-        _build_sleeve(side=-1.0, garment_type=garment_type, material_index=1),
-        _build_sleeve(side=1.0, garment_type=garment_type, material_index=1),
+        _build_garment_torso_half(is_front=True, garment_type=effective_type, material_index=1),
+        _build_garment_torso_half(is_front=False, garment_type=effective_type, material_index=1),
+        _build_collar_trim(garment_type=effective_type, material_index=1),
+        _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1),
+        _build_sleeve(side=1.0, garment_type=effective_type, material_index=1),
     ]
     garment_mesh = _merge_primitives(garment_parts, name="Garment", material_index=1)
 
