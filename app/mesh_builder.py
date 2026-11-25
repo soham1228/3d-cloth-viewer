@@ -604,9 +604,9 @@ def _build_sleeve(
         uvs = np.zeros((ns, ntheta_half, 2), dtype=np.float32)
 
         if is_front:
-            u_shoulder, u_cuff = (0.415, 0.495) if side > 0 else (0.085, 0.005)
+            u_inner, u_outer = (0.415, 0.495) if side > 0 else (0.085, 0.005)
         else:
-            u_shoulder, u_cuff = (0.585, 0.505) if side > 0 else (0.915, 0.995)
+            u_inner, u_outer = (0.585, 0.505) if side > 0 else (0.915, 0.995)
 
         for is_idx in range(ns):
             sf = float(s_frac[is_idx])
@@ -633,9 +633,10 @@ def _build_sleeve(
 
                 grid[is_idx, ip] = (1.0 - w_tube) * pt_seam + w_tube * pt_tube
 
-                u = u_shoulder + sf * (u_cuff - u_shoulder)
-                y_dir = float(radial[1] / max(1e-5, float(np.linalg.norm(radial))))
-                v = 0.48 - 0.32 * y_dir
+                # Vertical v runs shoulder -> cuff (0.04 -> 0.96) so hanging sleeve graphics stay upright
+                outer_frac = 0.5 - 0.5 * side * float(np.sin(phi))
+                u = u_inner + outer_frac * (u_outer - u_inner)
+                v = 0.04 + sf * 0.92
                 uvs[is_idx, ip] = [u, v]
 
         parts.append(
