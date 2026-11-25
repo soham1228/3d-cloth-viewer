@@ -207,56 +207,89 @@ def extract_garment(image_bytes: bytes) -> ExtractedGarment:
     )
 
 
-def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Image.Image:
-    """Pack a single garment side (front or back) into a standardized square UV tile.
+def _extract_clean_sleeve_patch(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    x_slice: slice,
+    y_slice: slice,
+    fallback_rgb: np.ndarray,
+    fallback_mask: np.ndarray,
+    target_w: int,
+    target_h: int,
+) -> Image.Image:
+    """Extract an undistorted, streak-free fabric patch from the interior of the sleeve."""
+    sub_rgb = rgb[y_slice, x_slice]
+    sub_mask = mask[y_slice, x_slice]
 
-    Layout inside the square [0..1] x [0..1] (image top = 0, bottom = 1):
-      - Torso region: horizontal [0.18 .. 0.82], vertical [0.02 .. 0.98]
-      - Left-side sleeve swatch: horizontal [0.00 .. 0.18], vertical [0.02 .. 0.98]
-      - Right-side sleeve swatch: horizontal [0.82 .. 1.00], vertical [0.02 .. 0.98]
-    This gives both torso-only uploads and full flat-lay uploads crisp, aligned UVs!
-    """
+    # Try largest inscribed square inside the sleeve mask (zero stretching or row-banding)
+    for region_rgb, region_mask in ((sub_rgb, sub_mask), (fallback_rgb, fallback_mask)):
+        if region_rgb.size == 0 or region_mask.size == 0 or np.sum(region_mask > 0) < 64:
+            continue
+        dist = cv2.distanceTransform((region_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        max_r = float(dist.max())
+        if max_r >= 10.0:
+            cy, cx = np.unravel_index(int(np.argmax(dist)), dist.shape)
+            half = max(6, int(max_r * 0.68))
+            y0, y1 = max(0, cy - half), min(region_rgb.shape[0], cy + half)
+            x0, x1 = max(0, cx - half), min(region_rgb.shape[1], cx + half)
+            patch = region_rgb[y0:y1, x0:x1]
+            if patch.shape[0] >= 8 and patch.shape[1] >= 8:
+                # Mirror-tile 2x2 so the texture repeats seamlessly without visible seam edges
+                h_flip = np.concatenate([patch, patch[:, ::-1]], axis=1)
+                full_tile = np.concatenate([h_flip, h_flip[::-1, :]], axis=0)
+                return Image.fromarray(full_tile, mode="RGB").resize(
+                    (target_w, target_h), Image.Resampling.LANCZOS
+                )
+
+    return Image.fromarray(fallback_rgb, mode="RGB").resize(
+        (target_w, target_h), Image.Resampling.LANCZOS
+    )
+
+
+def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Image.Image:
+    """Pack a single garment side (front or back) into a standardized square UV tile."""
     h, w = garment.rgba.shape[:2]
     tx0, tx1 = garment.torso_x_range
     tx1 = max(tx0 + 1, tx1)
 
-    torso_crop = Image.fromarray(garment.rgba[:, tx0:tx1, :3], mode="RGB")
+    # Inset torso crop slightly (1.5%) to avoid edge shadows/fringes along side seams
+    inset = max(1, (tx1 - tx0) // 65)
+    crop_x0 = min(tx1 - 1, tx0 + inset)
+    crop_x1 = max(crop_x0 + 1, tx1 - inset)
 
-    # Determine whether meaningful sleeve wings exist outside the torso bounds
-    left_wing_w = tx0
-    right_wing_w = w - tx1
+    rgb = garment.rgba[:, :, :3]
+    mask = garment.mask
+    torso_crop = Image.fromarray(rgb[:, crop_x0:crop_x1], mode="RGB")
+
     sleeve_y_end = max(2, int(h * 0.55))
-
-    if left_wing_w >= max(12, int(w * 0.06)):
-        left_sleeve = Image.fromarray(
-            garment.rgba[:sleeve_y_end, :tx0, :3], mode="RGB"
-        )
-    else:
-        # Fallback: sample upper-left shoulder strip of torso
-        strip_w = max(8, (tx1 - tx0) // 6)
-        left_sleeve = Image.fromarray(
-            garment.rgba[:sleeve_y_end, tx0 : tx0 + strip_w, :3], mode="RGB"
-        )
-
-    if right_wing_w >= max(12, int(w * 0.06)):
-        right_sleeve = Image.fromarray(
-            garment.rgba[:sleeve_y_end, tx1:w, :3], mode="RGB"
-        )
-    else:
-        strip_w = max(8, (tx1 - tx0) // 6)
-        right_sleeve = Image.fromarray(
-            garment.rgba[:sleeve_y_end, max(tx0, tx1 - strip_w) : tx1, :3], mode="RGB"
-        )
-
-    tile = Image.new("RGB", (size, size), garment.dominant_color)
-
     torso_px_left = int(size * 0.18)
     torso_px_right = int(size * 0.82)
     torso_px_w = torso_px_right - torso_px_left
+    shoulder_strip_w = max(12, (crop_x1 - crop_x0) // 5)
 
+    left_resized = _extract_clean_sleeve_patch(
+        rgb=rgb,
+        mask=mask,
+        x_slice=slice(0, tx0),
+        y_slice=slice(0, sleeve_y_end),
+        fallback_rgb=rgb[:sleeve_y_end, crop_x0 : crop_x0 + shoulder_strip_w],
+        fallback_mask=mask[:sleeve_y_end, crop_x0 : crop_x0 + shoulder_strip_w],
+        target_w=torso_px_left,
+        target_h=size,
+    )
+    right_resized = _extract_clean_sleeve_patch(
+        rgb=rgb,
+        mask=mask,
+        x_slice=slice(tx1, w),
+        y_slice=slice(0, sleeve_y_end),
+        fallback_rgb=rgb[:sleeve_y_end, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
+        fallback_mask=mask[:sleeve_y_end, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
+        target_w=size - torso_px_right,
+        target_h=size,
+    )
+
+    tile = Image.new("RGB", (size, size), garment.dominant_color)
     torso_resized = torso_crop.resize((torso_px_w, size), Image.Resampling.LANCZOS)
-    left_resized = left_sleeve.resize((torso_px_left, size), Image.Resampling.LANCZOS)
-    right_resized = right_sleeve.resize((size - torso_px_right, size), Image.Resampling.LANCZOS)
 
     tile.paste(left_resized, (0, 0))
     tile.paste(torso_resized, (torso_px_left, 0))

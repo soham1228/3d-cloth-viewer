@@ -391,7 +391,7 @@ def _build_garment_torso_half(
     garment_type: GarmentType,
     material_index: int,
 ) -> MeshPrimitiveData:
-    """Build front or back garment torso+shoulder shell ending cleanly at sleeve armhole."""
+    """Build front or back garment torso+shoulder shell with uniform arc spacing (no side pinch)."""
     ny = 52
     nx = 65
     y_bottom = -0.245
@@ -399,7 +399,9 @@ def _build_garment_torso_half(
     waist_ease = 0.012
     neck_half_w = 0.083
 
-    u_xs = np.linspace(-1.0, 1.0, nx)
+    # Use sine-spaced columns (angle theta in [-pi/2, +pi/2]) so side curves have uniform arc spacing
+    thetas_col = np.linspace(-np.pi / 2.0, np.pi / 2.0, nx)
+    u_xs = np.sin(thetas_col)
     x_dir = u_xs if is_front else -u_xs
 
     # Shoulder crest at y=0.335 (rx = 0.182 + 0.015 = 0.197)
@@ -422,6 +424,7 @@ def _build_garment_torso_half(
     s_vals = np.linspace(0.0, 1.0, ny)
 
     for ix in range(nx):
+        th_col = float(thetas_col[ix])
         u_col = float(u_xs[ix])
         xd = float(x_dir[ix])
         y_top = float(y_tops[ix])
@@ -450,7 +453,9 @@ def _build_garment_torso_half(
 
             grid[iy, ix] = pt
 
-            x_frac = 0.5 * (u_col + 1.0)
+            # Blend planar x & angular theta so center prints stay sharp and rounded sides don't stretch
+            arc_u = th_col / (np.pi / 2.0)
+            x_frac = 0.5 + 0.5 * (0.45 * u_col + 0.55 * arc_u)
             u = u_start + x_frac * (u_end - u_start)
             v_norm = float(np.clip((0.422 - y_val) / (0.422 - y_bottom), 0.0, 1.0))
             v = 0.03 + v_norm * 0.94
@@ -491,9 +496,9 @@ def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPr
             if iy == 0:
                 y_cur, off = y_base - 0.002, garment_offset
             elif iy == 1:
-                y_cur, off = y_base + collar_h * 0.45, garment_offset + 0.004
+                y_cur, off = y_base + collar_h * 0.45, garment_offset + 0.0025
             elif iy == 2:
-                y_cur, off = y_base + collar_h * 0.90, garment_offset + 0.002
+                y_cur, off = y_base + collar_h * 0.85, garment_offset + 0.001
             else:
                 y_cur, off = y_base + collar_h * 0.55, 0.004
 
@@ -574,13 +579,13 @@ def _build_sleeve(
             for ip, phi in enumerate(phis):
                 radial = np.cos(phi) * (rz * n_vec) + np.sin(phi) * (ry * b_vec)
                 pt = c + radial
-                # Pull upper armhole rim outward to meet outer shoulder tip (x=±0.197, y=0.330) seamlessly
+                # Gently tuck upper armhole inside shoulder slope so there is no bumpy shelf
                 if sf < 0.25:
                     y_rel = float(radial[1])
                     if y_rel > 0:
                         blend = 1.0 - sf / 0.25
-                        pt[0] += side * blend * 0.022 * (y_rel / max(1e-4, ry))
-                        pt[1] -= blend * 0.012 * (y_rel / max(1e-4, ry))
+                        pt[0] += side * blend * 0.010 * (y_rel / max(1e-4, ry))
+                        pt[1] -= blend * 0.015 * (y_rel / max(1e-4, ry))
                 grid[is_idx, ip] = pt
 
                 u = u_shoulder + sf * (u_cuff - u_shoulder)
