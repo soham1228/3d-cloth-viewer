@@ -48,14 +48,16 @@ def _get_mediapipe_models():
 
 @dataclass
 class ExtractedGarment:
-    """Processed garment image with tight crop, torso bounds, and sleeve type."""
+    """Processed garment image with tight crop, torso bounds, and sleeve/length metadata."""
 
     rgba: np.ndarray  # H x W x 4 uint8
     mask: np.ndarray  # H x W uint8 (0 or 255)
     torso_x_range: Tuple[int, int]  # (x_left, x_right) in cropped image coordinates
+    torso_y_range: Tuple[int, int]  # (y_top, y_bottom) of torso in cropped image coordinates
     dominant_color: Tuple[int, int, int]  # RGB
     is_long_sleeve: bool = False
     from_human: bool = False
+    torso_aspect: float = 1.55  # height / width of torso (lower = cropped top)
 
 
 def _load_image_rgba(image_bytes: bytes) -> np.ndarray:
@@ -407,31 +409,82 @@ def _inpaint_background(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
-def _estimate_torso_bounds(mask: np.ndarray) -> Tuple[int, int]:
-    """Estimate horizontal torso bounds (excluding protruding flat-lay sleeves)."""
+def _estimate_flatlay_torso_and_sleeves(mask: np.ndarray) -> Tuple[Tuple[int, int], Tuple[int, int], bool, float]:
+    """Locate torso X/Y bounds, flat-lay long-sleeve presence, and height/width aspect ratio.
+
+    Scanning contiguous center runs handles cropped tops with long hanging sleeves
+    (where sleeves extend well below the cropped waistband).
+    """
     h, w = mask.shape
-    y_start = int(h * 0.48)
-    y_end = int(h * 0.88)
-    band = mask[y_start:y_end, :]
+    cx = w // 2
+    spans = []
+    for r in range(h):
+        row = mask[r]
+        if row[cx] == 0:
+            sub = np.where(row[int(w * 0.40) : int(w * 0.60)] > 0)[0]
+            if len(sub) == 0:
+                spans.append((r, 0, 0, 0))
+                continue
+            seed = int(w * 0.40) + int(sub[len(sub) // 2])
+        else:
+            seed = cx
+        lx, rx = seed, seed
+        while lx > 0 and row[lx - 1] > 0:
+            lx -= 1
+        while rx < w - 1 and row[rx + 1] > 0:
+            rx += 1
+        spans.append((r, lx, rx, rx - lx + 1))
 
-    left_edges = []
-    right_edges = []
-    for row in band:
-        xs = np.where(row > 0)[0]
-        if len(xs) > w * 0.2:
-            left_edges.append(int(xs[0]))
-            right_edges.append(int(xs[-1]))
+    valid = [s for s in spans if s[3] > w * 0.15]
+    if not valid:
+        return (0, w - 1), (0, h), False, 1.55
 
-    if not left_edges:
-        return 0, w - 1
+    ty0, ty1 = valid[0][0], valid[-1][0] + 1
+    th = max(1, ty1 - ty0)
 
-    torso_left = int(np.percentile(left_edges, 25))
-    torso_right = int(np.percentile(right_edges, 75))
+    # Bottom 35% of torso avoids sleeves attached near upper chest/armpits
+    lower = [s for s in valid if s[0] >= ty0 + int(th * 0.65)]
+    if not lower:
+        lower = valid
+    widths = [s[3] for s in lower]
+    min_w = float(np.percentile(widths, 8))
+    best = [s for s in lower if s[3] <= min_w * 1.10]
+    tx0 = int(np.median([s[1] for s in best])) if best else 0
+    tx1 = int(np.median([s[2] for s in best])) if best else (w - 1)
 
-    if (torso_right - torso_left) < w * 0.35:
-        return 0, w - 1
+    if (tx1 - tx0) < w * 0.30:
+        tx0, tx1 = 0, w - 1
+    tw = max(1, tx1 - tx0)
 
-    return max(0, torso_left), min(w - 1, torso_right)
+    # Measure shoulder top inside torso bounds (excludes tall hoods rising above shoulders)
+    sh_ys = []
+    for col_x in (min(w - 1, tx0 + 4), max(0, tx1 - 4)):
+        col_fg = np.where(mask[:, col_x] > 0)[0]
+        if len(col_fg) > 0:
+            sh_ys.append(int(col_fg.min()))
+    sh_y = float(np.mean(sh_ys)) if sh_ys else float(ty0)
+    if sh_y > ty0 + th * 0.35:
+        sh_y = float(ty0)
+
+    torso_aspect = float(max(0.55, (ty1 - sh_y) / tw))
+
+    # Detect flat-lay long sleeves from outer wing reach below torso mid-height
+    left_wing = mask[:, :tx0]
+    right_wing = mask[:, tx1:]
+    wing_rows = np.where(
+        (left_wing > 0).any(axis=1) if left_wing.size else np.zeros(h, dtype=bool)
+        | ((right_wing > 0).any(axis=1) if right_wing.size else np.zeros(h, dtype=bool))
+    )[0]
+    wing_y_max = int(wing_rows.max()) if len(wing_rows) else ty0
+    wing_reach = tx0 + (w - tx1)
+    is_long_sleeve = bool(wing_y_max > ty0 + int(th * 0.72) and wing_reach >= tw * 0.60)
+
+    # When long sleeves hang well below the torso hem, the garment is cropped
+    if is_long_sleeve and wing_y_max > ty1 + 10:
+        crop_ratio = float(np.clip((ty1 / max(1, wing_y_max)) / 0.88, 0.65, 1.0))
+        torso_aspect = float(torso_aspect * crop_ratio)
+
+    return (max(0, tx0), min(w - 1, tx1)), (ty0, ty1), is_long_sleeve, torso_aspect
 
 
 def extract_garment(image_bytes: bytes, expect_human: bool = False) -> ExtractedGarment:
@@ -482,23 +535,31 @@ def extract_garment(image_bytes: bytes, expect_human: bool = False) -> Extracted
     filled_rgba = np.dstack([filled_rgb, np.full(cropped_mask.shape, 255, dtype=np.uint8)])
 
     ch, cw = inner_mask.shape
+    flat_tx, flat_ty, flat_long, torso_aspect = _estimate_flatlay_torso_and_sleeves(inner_mask)
+
     if raw_torso_bounds is not None:
         tx0 = max(0, min(cw - 2, raw_torso_bounds[0] - x0))
         tx1 = max(tx0 + 1, min(cw - 1, raw_torso_bounds[1] - x0))
         if (tx1 - tx0) < cw * 0.35:
-            torso_bounds = _estimate_torso_bounds(inner_mask)
+            torso_bounds = flat_tx
         else:
             torso_bounds = (tx0, tx1)
+        torso_y_bounds = (0, ch)
+        torso_aspect = max(1.35, float(ch / max(1, torso_bounds[1] - torso_bounds[0])))
     else:
-        torso_bounds = _estimate_torso_bounds(inner_mask)
+        torso_bounds = flat_tx
+        torso_y_bounds = flat_ty
+        is_long_sleeve = flat_long
 
     return ExtractedGarment(
         rgba=filled_rgba,
         mask=inner_mask,
         torso_x_range=torso_bounds,
+        torso_y_range=torso_y_bounds,
         dominant_color=dominant_color,
         is_long_sleeve=is_long_sleeve,
         from_human=from_human,
+        torso_aspect=torso_aspect,
     )
 
 
@@ -610,6 +671,8 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
     h, w = garment.rgba.shape[:2]
     tx0, tx1 = garment.torso_x_range
     tx1 = max(tx0 + 1, tx1)
+    ty0, ty1 = garment.torso_y_range
+    ty1 = max(ty0 + 2, min(h, ty1))
 
     inset = max(1, (tx1 - tx0) // 65)
     crop_x0 = min(tx1 - 1, tx0 + inset)
@@ -617,9 +680,9 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
 
     rgb = garment.rgba[:, :, :3]
     mask = garment.mask
-    torso_crop = Image.fromarray(rgb[:, crop_x0:crop_x1], mode="RGB")
+    torso_crop = Image.fromarray(rgb[ty0:ty1, crop_x0:crop_x1], mode="RGB")
 
-    sleeve_y_end = max(2, int(h * (0.85 if garment.is_long_sleeve else 0.55)))
+    sleeve_y_end = max(2, int(h * (0.95 if garment.is_long_sleeve else 0.55)))
     torso_px_left = int(size * 0.18)
     torso_px_right = int(size * 0.82)
     torso_px_w = torso_px_right - torso_px_left
@@ -630,7 +693,7 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
             rgb=rgb,
             mask=mask,
             x_slice=slice(0, tx0),
-            fallback_rgb=rgb[:, crop_x0 : crop_x0 + shoulder_strip_w],
+            fallback_rgb=rgb[ty0:ty1, crop_x0 : crop_x0 + shoulder_strip_w],
             target_w=torso_px_left,
             target_h=size,
         )
@@ -638,7 +701,7 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
             rgb=rgb,
             mask=mask,
             x_slice=slice(tx1, w),
-            fallback_rgb=rgb[:, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
+            fallback_rgb=rgb[ty0:ty1, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
             target_w=size - torso_px_right,
             target_h=size,
         )
@@ -648,8 +711,8 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
             mask=mask,
             x_slice=slice(0, tx0),
             y_slice=slice(0, sleeve_y_end),
-            fallback_rgb=rgb[:sleeve_y_end, crop_x0 : crop_x0 + shoulder_strip_w],
-            fallback_mask=mask[:sleeve_y_end, crop_x0 : crop_x0 + shoulder_strip_w],
+            fallback_rgb=rgb[ty0:ty1, crop_x0 : crop_x0 + shoulder_strip_w],
+            fallback_mask=mask[ty0:ty1, crop_x0 : crop_x0 + shoulder_strip_w],
             target_w=torso_px_left,
             target_h=size,
         )
@@ -658,8 +721,8 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
             mask=mask,
             x_slice=slice(tx1, w),
             y_slice=slice(0, sleeve_y_end),
-            fallback_rgb=rgb[:sleeve_y_end, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
-            fallback_mask=mask[:sleeve_y_end, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
+            fallback_rgb=rgb[ty0:ty1, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
+            fallback_mask=mask[ty0:ty1, max(crop_x0, crop_x1 - shoulder_strip_w) : crop_x1],
             target_w=size - torso_px_right,
             target_h=size,
         )
@@ -673,8 +736,8 @@ def _pack_garment_tile(garment: ExtractedGarment, size: int = HALF_SIZE) -> Imag
     return tile
 
 
-def build_garment_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tuple[bytes, bool]:
-    """Build a 2048x1024 PNG atlas and return (png_bytes, is_long_sleeve)."""
+def build_garment_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tuple[bytes, bool, float]:
+    """Build a 2048x1024 PNG atlas and return (png_bytes, is_long_sleeve, torso_aspect)."""
     front = extract_garment(front_bytes)
     back = extract_garment(back_bytes, expect_human=front.from_human)
     if back.from_human and not front.from_human:
@@ -684,6 +747,8 @@ def build_garment_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tupl
     if is_long_sleeve:
         front.is_long_sleeve = True
         back.is_long_sleeve = True
+
+    torso_aspect = min(front.torso_aspect, back.torso_aspect)
     front_tile = _pack_garment_tile(front, HALF_SIZE)
     back_tile = _pack_garment_tile(back, HALF_SIZE)
 
@@ -693,10 +758,10 @@ def build_garment_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tupl
 
     out = io.BytesIO()
     atlas.save(out, format="PNG", optimize=True)
-    return out.getvalue(), is_long_sleeve
+    return out.getvalue(), is_long_sleeve, torso_aspect
 
 
 def build_garment_atlas(front_bytes: bytes, back_bytes: bytes) -> bytes:
     """Build a 2048x1024 PNG texture atlas combining front (left) and back (right)."""
-    png_bytes, _ = build_garment_atlas_with_meta(front_bytes, back_bytes)
+    png_bytes, _, _ = build_garment_atlas_with_meta(front_bytes, back_bytes)
     return png_bytes

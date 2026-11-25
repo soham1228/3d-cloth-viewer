@@ -511,12 +511,12 @@ def _build_garment_torso_half(
     garment_type: GarmentType,
     material_index: int,
     gender: MannequinGender = "male",
+    y_bottom: float = -0.205,
 ) -> MeshPrimitiveData:
     """Build front or back garment torso+shoulder shell contoured to male or female mannequin."""
     prof = _get_profile(gender)
     ny = 52
     nx = 65
-    y_bottom = -0.205
     garment_offset = 0.012
     waist_ease = 0.008
     neck_half_w = _neck_half_width(gender=gender, garment_offset=garment_offset)
@@ -764,8 +764,16 @@ def generate_mannequin_garment_glb(
     include_stand: bool = False,
 ) -> bytes:
     """Generate a complete 3D mannequin wearing the uploaded front/back garment as a .glb."""
-    atlas_png, is_long_sleeve = build_garment_atlas_with_meta(front_image_bytes, back_image_bytes)
+    atlas_png, is_long_sleeve, torso_aspect = build_garment_atlas_with_meta(
+        front_image_bytes, back_image_bytes
+    )
     effective_type: GarmentType = garment_type or ("long_sleeve" if is_long_sleeve else "tshirt")
+    # Preserve cropped vs full-length silhouette based on measured torso aspect ratio
+    y_bottom = (
+        -0.205
+        if torso_aspect >= 1.45
+        else float(np.interp(torso_aspect, [0.85, 1.45], [0.05, -0.205]))
+    )
     mannequin_rgba = MANNEQUIN_COLORS.get(mannequin_style, MANNEQUIN_COLORS["studio_charcoal"])
 
     materials = [
@@ -798,10 +806,18 @@ def generate_mannequin_garment_glb(
     mannequin_mesh = _build_mannequin_body(material_index=0, gender=mannequin_gender)
     garment_parts = [
         _build_garment_torso_half(
-            is_front=True, garment_type=effective_type, material_index=1, gender=mannequin_gender
+            is_front=True,
+            garment_type=effective_type,
+            material_index=1,
+            gender=mannequin_gender,
+            y_bottom=y_bottom,
         ),
         _build_garment_torso_half(
-            is_front=False, garment_type=effective_type, material_index=1, gender=mannequin_gender
+            is_front=False,
+            garment_type=effective_type,
+            material_index=1,
+            gender=mannequin_gender,
+            y_bottom=y_bottom,
         ),
         _build_collar_trim(garment_type=effective_type, material_index=1, gender=mannequin_gender),
         _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),

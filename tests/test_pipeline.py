@@ -134,9 +134,9 @@ def test_api_endpoints_and_mocked_s3():
     # Mocked S3 upload
     fake_s3 = S3UploadResult(
         bucket="my-shop-bucket",
-        key="garments/3d-models/test-sku-02.glb",
-        s3_uri="s3://my-shop-bucket/garments/3d-models/test-sku-02.glb",
-        model_url="https://my-shop-bucket.s3.ap-south-1.amazonaws.com/garments/3d-models/test-sku-02.glb",
+        key="garments/3d-models/female/test-sku-02.glb",
+        s3_uri="s3://my-shop-bucket/garments/3d-models/female/test-sku-02.glb",
+        model_url="https://my-shop-bucket.s3.ap-south-1.amazonaws.com/garments/3d-models/female/test-sku-02.glb",
     )
     with patch("app.main.upload_glb_to_s3", return_value=fake_s3) as mock_up:
         resp_s3 = client.post(
@@ -147,11 +147,13 @@ def test_api_endpoints_and_mocked_s3():
             },
             data={
                 "product_id": "test-sku-02",
+                "mannequin_gender": "female",
                 "upload_to_s3": "true",
             },
         )
         assert resp_s3.status_code == 200
         mock_up.assert_called_once()
+        assert mock_up.call_args.kwargs["prefix"].endswith("/female")
         s3_payload = resp_s3.json()
         assert s3_payload["s3"]["uploaded"] is True
         assert s3_payload["s3"]["model_url"] == fake_s3.model_url

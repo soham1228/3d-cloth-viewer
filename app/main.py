@@ -135,7 +135,8 @@ async def generate_3d_garment(
 
     if should_upload:
         try:
-            res = upload_glb_to_s3(glb_bytes, filename=filename)
+            gender_prefix = f"{settings.s3_prefix.strip('/')}/{mannequin_gender}".strip("/")
+            res = upload_glb_to_s3(glb_bytes, filename=filename, prefix=gender_prefix)
             s3_info = {
                 "uploaded": True,
                 "bucket": res.bucket,
