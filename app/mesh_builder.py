@@ -20,11 +20,11 @@ MANNEQUIN_COLORS: Dict[str, Tuple[float, float, float, float]] = {
     "matte_black": (0.07, 0.07, 0.08, 1.0),
 }
 
-# Smooth anatomical profile control knots (y from -0.25 hip to +0.52 neck)
-_KNOTS_Y = np.array([-0.25, -0.18, -0.06, 0.05, 0.18, 0.28, 0.335, 0.375, 0.405, 0.43, 0.52])
-_KNOTS_RX = np.array([0.165, 0.168, 0.156, 0.152, 0.176, 0.186, 0.182, 0.142, 0.098, 0.068, 0.056])
-_KNOTS_RF = np.array([0.099, 0.102, 0.095, 0.094, 0.118, 0.112, 0.094, 0.082, 0.071, 0.062, 0.055])
-_KNOTS_RB = np.array([0.095, 0.097, 0.090, 0.087, 0.103, 0.100, 0.090, 0.080, 0.070, 0.061, 0.055])
+# Smooth anatomical profile control knots (y from -0.25 hip to +0.50 neck)
+_KNOTS_Y = np.array([-0.25, -0.18, -0.06, 0.05, 0.18, 0.28, 0.335, 0.375, 0.405, 0.43, 0.50])
+_KNOTS_RX = np.array([0.165, 0.168, 0.156, 0.152, 0.176, 0.186, 0.182, 0.140, 0.092, 0.056, 0.049])
+_KNOTS_RF = np.array([0.099, 0.102, 0.095, 0.094, 0.118, 0.112, 0.094, 0.080, 0.066, 0.052, 0.048])
+_KNOTS_RB = np.array([0.095, 0.097, 0.090, 0.087, 0.103, 0.100, 0.090, 0.078, 0.065, 0.051, 0.048])
 
 _RX_SPLINE = PchipInterpolator(_KNOTS_Y, _KNOTS_RX, extrapolate=True)
 _RF_SPLINE = PchipInterpolator(_KNOTS_Y, _KNOTS_RF, extrapolate=True)
@@ -42,7 +42,7 @@ def _torso_profile(
     waist_ease: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return C1-smooth anatomical (rx, rz_front, rz_back) across vertical height y."""
-    y_clamped = np.clip(y, -0.25, 0.52)
+    y_clamped = np.clip(y, -0.25, 0.50)
     rx = _RX_SPLINE(y_clamped)
     rf = _RF_SPLINE(y_clamped)
     rb = _RB_SPLINE(y_clamped)
@@ -183,10 +183,18 @@ def _triangulate_grid(
             v01 = r * cols + c_next
             v10 = (r + 1) * cols + c
             v11 = (r + 1) * cols + c_next
+            # Alternate quad diagonal in checkerboard pattern to prevent diagonal shading bands
+            use_alt = ((r + c) % 2) == 1
             if flip_winding:
-                indices.extend([v00, v11, v01, v00, v10, v11])
+                if use_alt:
+                    indices.extend([v00, v10, v01, v01, v10, v11])
+                else:
+                    indices.extend([v00, v11, v01, v00, v10, v11])
             else:
-                indices.extend([v00, v01, v11, v00, v11, v10])
+                if use_alt:
+                    indices.extend([v00, v01, v10, v01, v11, v10])
+                else:
+                    indices.extend([v00, v01, v11, v00, v11, v10])
 
     idx_arr = np.array(indices, dtype=np.uint32)
     normals = _compute_smooth_normals(positions, idx_arr)
@@ -306,12 +314,13 @@ def _build_tube_along_curve(
 
 
 def _arm_centerline(side: float, t_vals: np.ndarray) -> np.ndarray:
-    """Relaxed, natural mannequin arm curve from shoulder socket down to forearm."""
+    """Relaxed mannequin arm with subtle outward shoulder curve and forward elbow bend."""
+    elbow_bend = np.clip((t_vals - 0.35) / 0.65, 0.0, 1.0)
     return np.column_stack(
         [
-            side * (0.160 + 0.105 * t_vals + 0.012 * np.sin(np.pi * t_vals)),
-            0.278 - 0.415 * t_vals,
-            -0.004 + 0.028 * (t_vals ** 1.5),
+            side * (0.160 + 0.102 * t_vals + 0.010 * np.sin(np.pi * t_vals)),
+            0.278 - 0.420 * t_vals,
+            -0.004 + 0.036 * (elbow_bend ** 1.35),
         ]
     )
 
@@ -321,8 +330,8 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
 
-    # Torso ends at y=-0.210 so it sits cleanly inside the garment hem (y=-0.245)
-    ys_body = np.linspace(-0.210, 0.52, 42)
+    # Torso ends at y=-0.210 inside garment hem; sleek neck ends at y=0.495 + 0.028 dome
+    ys_body = np.linspace(-0.210, 0.495, 42)
     dome_angles = np.linspace(0.0, np.pi / 2.0, 10)[1:]
     ny = len(ys_body) + len(dome_angles)
 
@@ -338,7 +347,7 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
     base_center_x = float(np.mean(base_ring[:, 0]))
     base_center_z = float(np.mean(base_ring[:, 2]))
     base_y = float(ys_body[-1])
-    dome_height = 0.038
+    dome_height = 0.028
 
     for j, ang in enumerate(dome_angles):
         iy = len(ys_body) + j
@@ -357,10 +366,10 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
 
     arm_parts = [torso_prim, bottom_cap]
     for side in (-1.0, 1.0):
-        t_vals = np.linspace(0.0, 1.0, 24)
+        t_vals = np.linspace(0.0, 1.0, 26)
         centers = _arm_centerline(side, t_vals)
-        # Subtle bicep -> forearm taper with clean rounded hand-stump end
-        radii = 0.044 - 0.011 * t_vals + 0.002 * np.sin(np.pi * t_vals)
+        # Anatomical upper arm -> forearm -> sleek wrist taper
+        radii = 0.041 - 0.015 * t_vals + 0.0025 * np.sin(np.pi * t_vals)
         radii[-2] *= 0.86
         radii[-1] *= 0.62
         arm_parts.append(
@@ -474,6 +483,11 @@ def _build_garment_torso_half(
                     x_val = float(np.clip(x_val, -rx_y, rx_y))
 
             pt = _eval_torso_point(x_val, y_val, is_front=is_front, extra_offset=garment_offset, waist_ease=waist_ease)
+            # Subtle vertical cloth drape ripples in lower torso/hem (vanishing at side seams z=0)
+            if s < 0.55 and ix not in (0, nx - 1):
+                drape_fade = (1.0 - float(s) / 0.55) ** 1.6
+                drape_z = 0.0022 * float(np.cos(th_col)) * float(np.cos(5.0 * th_col)) * drape_fade
+                pt[2] += drape_z if is_front else -drape_z
             if (is_shoulder and iy == ny - 1) or ix == 0 or ix == nx - 1:
                 pt[2] = 0.005 * float(np.sin((y_val - 0.05) * 5.5))
 

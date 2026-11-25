@@ -217,11 +217,13 @@ def _extract_clean_sleeve_patch(
     target_w: int,
     target_h: int,
 ) -> Image.Image:
-    """Extract an undistorted, streak-free fabric patch from the interior of the sleeve."""
+    """Extract a crisp, streak-free fabric swatch from sleeve/shoulder and tile at 1:1 grain scale."""
     sub_rgb = rgb[y_slice, x_slice]
     sub_mask = mask[y_slice, x_slice]
 
-    # Try largest inscribed square inside the sleeve mask (zero stretching or row-banding)
+    # Prefer a large clean patch (larger radius = sharper fabric grain); fallback to shoulder torso
+    best_patch = None
+    best_size = 0
     for region_rgb, region_mask in ((sub_rgb, sub_mask), (fallback_rgb, fallback_mask)):
         if region_rgb.size == 0 or region_mask.size == 0 or np.sum(region_mask > 0) < 64:
             continue
@@ -229,17 +231,32 @@ def _extract_clean_sleeve_patch(
         max_r = float(dist.max())
         if max_r >= 10.0:
             cy, cx = np.unravel_index(int(np.argmax(dist)), dist.shape)
-            half = max(6, int(max_r * 0.68))
+            half = max(6, int(max_r * 0.70))
             y0, y1 = max(0, cy - half), min(region_rgb.shape[0], cy + half)
             x0, x1 = max(0, cx - half), min(region_rgb.shape[1], cx + half)
             patch = region_rgb[y0:y1, x0:x1]
-            if patch.shape[0] >= 8 and patch.shape[1] >= 8:
-                # Mirror-tile 2x2 so the texture repeats seamlessly without visible seam edges
-                h_flip = np.concatenate([patch, patch[:, ::-1]], axis=1)
-                full_tile = np.concatenate([h_flip, h_flip[::-1, :]], axis=0)
-                return Image.fromarray(full_tile, mode="RGB").resize(
-                    (target_w, target_h), Image.Resampling.LANCZOS
-                )
+            if min(patch.shape[:2]) > best_size:
+                best_patch = patch
+                best_size = min(patch.shape[:2])
+            # Only keep sleeve patch directly if it's reasonably sharp (>= 28px); else prefer larger shoulder patch
+            if best_size >= 28:
+                break
+
+    if best_patch is not None and best_size >= 8:
+        # Build seamless 2x2 mirrored tile, then repeat at natural fabric scale instead of stretching 40x
+        h_flip = np.concatenate([best_patch, best_patch[:, ::-1]], axis=1)
+        tile_2x2 = np.concatenate([h_flip, h_flip[::-1, :]], axis=0)
+        # Scale tile_2x2 so each original pixel stays crisp (around 1.5x-2x of input)
+        tile_h, tile_w = tile_2x2.shape[:2]
+        cell_w = max(48, min(target_w, tile_w * 2))
+        cell_h = max(48, min(target_h // 2, tile_h * 2))
+        cell = np.array(
+            Image.fromarray(tile_2x2, mode="RGB").resize((cell_w, cell_h), Image.Resampling.LANCZOS)
+        )
+        rep_y = (target_h + cell_h - 1) // cell_h
+        rep_x = (target_w + cell_w - 1) // cell_w
+        tiled = np.tile(cell, (rep_y, rep_x, 1))[:target_h, :target_w]
+        return Image.fromarray(tiled, mode="RGB")
 
     return Image.fromarray(fallback_rgb, mode="RGB").resize(
         (target_w, target_h), Image.Resampling.LANCZOS
