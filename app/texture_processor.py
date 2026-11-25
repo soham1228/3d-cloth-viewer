@@ -111,25 +111,22 @@ def _clean_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def _inpaint_background(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Fill non-garment pixels with nearest garment edge color to prevent UV bleed."""
+    """Fill non-garment pixels with nearest inner garment pixel to prevent UV bleed."""
     inv_mask = np.where(mask == 0, 255, 0).astype(np.uint8)
-    if np.all(inv_mask == 0):
+    if np.all(inv_mask == 0) or np.all(mask == 0):
         return rgb
 
-    # Downsample for fast Navier-Stokes inpaint, then blend sharp edges
-    h, w = rgb.shape[:2]
-    scale = min(1.0, 512.0 / max(h, w))
-    if scale < 1.0:
-        sw, sh = max(16, int(w * scale)), max(16, int(h * scale))
-        small_rgb = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
-        small_inv = cv2.resize(inv_mask, (sw, sh), interpolation=cv2.INTER_NEAREST)
-        inpainted_small = cv2.inpaint(small_rgb, small_inv, 7, cv2.INPAINT_TELEA)
-        inpainted = cv2.resize(inpainted_small, (w, h), interpolation=cv2.INTER_LINEAR)
-    else:
-        inpainted = cv2.inpaint(rgb, inv_mask, 7, cv2.INPAINT_TELEA)
-
+    # Nearest foreground pixel copy (zero halo / zero background fringe bleed)
+    _, labels = cv2.distanceTransformWithLabels(
+        inv_mask, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL
+    )
+    fg_coords = np.argwhere(mask > 0)  # (K, 2) in (y, x)
+    # OpenCV labels are 1-indexed into foreground pixels in raster order
+    nearest_idx = np.clip(labels - 1, 0, len(fg_coords) - 1)
+    ny = fg_coords[nearest_idx, 0]
+    nx = fg_coords[nearest_idx, 1]
+    out = rgb[ny, nx]
     fg = mask > 0
-    out = inpainted.copy()
     out[fg] = rgb[fg]
     return out
 
@@ -183,21 +180,28 @@ def extract_garment(image_bytes: bytes) -> ExtractedGarment:
     cropped_rgba = rgba[y0:y1, x0:x1].copy()
     cropped_mask = mask[y0:y1, x0:x1].copy()
 
-    fg_pixels = cropped_rgba[cropped_mask > 0][:, :3]
+    # Erode mask slightly before inpainting to strip 1-3px white/studio anti-alias fringes
+    erode_px = max(2, min(6, min(cropped_mask.shape) // 90))
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
+    inner_mask = cv2.erode(cropped_mask, erode_kernel, iterations=1)
+    if np.sum(inner_mask > 0) < np.sum(cropped_mask > 0) * 0.5:
+        inner_mask = cropped_mask
+
+    fg_pixels = cropped_rgba[inner_mask > 0][:, :3]
     if len(fg_pixels) > 0:
         med = np.median(fg_pixels, axis=0).astype(int)
         dominant_color = (int(med[0]), int(med[1]), int(med[2]))
     else:
         dominant_color = (220, 220, 220)
 
-    # Inpaint background with garment edge colors so no background leaks at seams
-    filled_rgb = _inpaint_background(cropped_rgba[:, :, :3], cropped_mask)
+    # Inpaint background + outer fringe with inner garment edge colors so no background leaks at seams
+    filled_rgb = _inpaint_background(cropped_rgba[:, :, :3], inner_mask)
     filled_rgba = np.dstack([filled_rgb, np.full(cropped_mask.shape, 255, dtype=np.uint8)])
 
-    torso_bounds = _estimate_torso_bounds(cropped_mask)
+    torso_bounds = _estimate_torso_bounds(inner_mask)
     return ExtractedGarment(
         rgba=filled_rgba,
-        mask=cropped_mask,
+        mask=inner_mask,
         torso_x_range=torso_bounds,
         dominant_color=dominant_color,
     )

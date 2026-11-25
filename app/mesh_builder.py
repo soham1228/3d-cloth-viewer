@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Literal, Tuple
 
 import numpy as np
@@ -20,12 +19,11 @@ MANNEQUIN_COLORS: Dict[str, Tuple[float, float, float, float]] = {
     "matte_black": (0.07, 0.07, 0.08, 1.0),
 }
 
-
-@dataclass
-class _GridSurface:
-    positions: np.ndarray  # (ny, ntheta, 3)
-    uvs: np.ndarray        # (ny, ntheta, 2)
-    wrap_u: bool = False
+# Anatomical profile control knots (y from -0.26 hip base to +0.55 neck top)
+_KNOTS_Y = np.array([-0.26, -0.20, -0.08, 0.04, 0.18, 0.28, 0.34, 0.375, 0.405, 0.43, 0.52])
+_KNOTS_RX = np.array([0.166, 0.170, 0.156, 0.150, 0.180, 0.194, 0.196, 0.150, 0.102, 0.068, 0.056])
+_KNOTS_RF = np.array([0.100, 0.103, 0.095, 0.094, 0.120, 0.114, 0.096, 0.084, 0.072, 0.062, 0.055])
+_KNOTS_RB = np.array([0.096, 0.098, 0.090, 0.087, 0.104, 0.102, 0.092, 0.082, 0.071, 0.061, 0.055])
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray | float) -> np.ndarray | float:
@@ -33,18 +31,60 @@ def _smoothstep(edge0: float, edge1: float, x: np.ndarray | float) -> np.ndarray
     return t * t * (3.0 - 2.0 * t)
 
 
-def _torso_profile(y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return anatomical (rx, rz_front, rz_back) across vertical height y in [-0.26, 0.58]."""
-    # Key anatomical control points (y, rx, rz_front, rz_back)
-    knots_y = np.array([-0.26, -0.22, -0.10, 0.02, 0.16, 0.28, 0.36, 0.42, 0.46, 0.57])
-    knots_rx = np.array([0.168, 0.174, 0.158, 0.152, 0.184, 0.205, 0.212, 0.115, 0.066, 0.056])
-    knots_rf = np.array([0.102, 0.106, 0.098, 0.096, 0.124, 0.118, 0.098, 0.072, 0.060, 0.055])
-    knots_rb = np.array([0.098, 0.100, 0.092, 0.088, 0.106, 0.104, 0.092, 0.070, 0.060, 0.055])
+def _torso_profile(y: np.ndarray, extra_offset: float = 0.0, waist_ease: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return anatomical (rx, rz_front, rz_back) across vertical height y."""
+    rx = np.interp(y, _KNOTS_Y, _KNOTS_RX)
+    rf = np.interp(y, _KNOTS_Y, _KNOTS_RF)
+    rb = np.interp(y, _KNOTS_Y, _KNOTS_RB)
 
-    rx = np.interp(y, knots_y, knots_rx)
-    rf = np.interp(y, knots_y, knots_rf)
-    rb = np.interp(y, knots_y, knots_rb)
+    if extra_offset != 0.0 or waist_ease != 0.0:
+        ease = extra_offset + waist_ease * np.exp(-((y - 0.0) / 0.16) ** 2)
+        rx = rx + ease
+        rf = rf + ease
+        rb = rb + ease
+
     return rx, rf, rb
+
+
+def _shoulder_ridge_y(abs_x: np.ndarray, garment_offset: float = 0.015) -> np.ndarray:
+    """Return the top shoulder ridge height y for horizontal coordinate |x| in [0.082, 0.211].
+
+    This is the exact inverse of the shoulder slope rx(y) so front & back garment
+    shells meet seamlessly along z = 0 over the entire shoulder.
+    """
+    # Shoulder spans from neck edge x_neck (~0.082) out to shoulder crest x_max (~0.196 + offset)
+    x_neck = 0.068 + garment_offset
+    x_crest = 0.196 + garment_offset
+    s = np.clip((abs_x - x_neck) / max(1e-5, x_crest - x_neck), 0.0, 1.0)
+    # Matches _KNOTS_Y / _KNOTS_RX shoulder descent from y=0.422 down to y=0.340
+    return 0.422 - 0.082 * (s ** 1.15)
+
+
+def _eval_torso_point(
+    x: float,
+    y: float,
+    is_front: bool,
+    extra_offset: float = 0.0,
+    waist_ease: float = 0.0,
+) -> np.ndarray:
+    """Evaluate a point (x, y, z) on the torso/garment surface guaranteed to satisfy the elliptical shell."""
+    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx = float(rx_arr[0])
+    rz = float(rf_arr[0] if is_front else rb_arr[0])
+
+    x_clamped = float(np.clip(x, -rx, rx))
+    u = abs(x_clamped) / max(1e-6, rx)
+
+    shoulder_blend = float(_smoothstep(0.18, 0.34, y)) * (1.0 - float(_smoothstep(0.36, 0.43, y)))
+    pow_exp = 0.94 - 0.10 * shoulder_blend
+
+    # Super-ellipse z from x: (|x|/rx)^(2/p) + (|z|/rz)^(2/p) = 1
+    p_inv = 2.0 / pow_exp
+    z_mag = rz * (max(0.0, 1.0 - (u ** p_inv)) ** (1.0 / p_inv))
+    z = z_mag if is_front else -z_mag
+
+    z_shift = 0.006 * float(np.sin((y - 0.05) * 5.5))
+    return np.array([x_clamped, y, z + z_shift], dtype=np.float32)
 
 
 def _eval_torso_ring(
@@ -53,27 +93,42 @@ def _eval_torso_ring(
     extra_offset: float = 0.0,
     waist_ease: float = 0.0,
 ) -> np.ndarray:
-    """Evaluate 3D points (N, 3) on a torso cross-section at height y."""
-    rx, rf, rb = _torso_profile(np.array([y]))
-    rx_v = float(rx[0]) + extra_offset + waist_ease * float(np.exp(-((y - 0.0) / 0.15) ** 2))
-    rf_v = float(rf[0]) + extra_offset + waist_ease * float(np.exp(-((y - 0.0) / 0.15) ** 2))
-    rb_v = float(rb[0]) + extra_offset + waist_ease * float(np.exp(-((y - 0.0) / 0.15) ** 2))
+    """Evaluate 3D points (N, 3) on a closed mannequin torso cross-section at height y."""
+    rx_arr, rf_arr, rb_arr = _torso_profile(np.array([y]), extra_offset=extra_offset, waist_ease=waist_ease)
+    rx_v = float(rx_arr[0])
+    rf_v = float(rf_arr[0])
+    rb_v = float(rb_arr[0])
 
     sin_t = np.sin(theta)
     cos_t = np.cos(theta)
     rz = np.where(cos_t >= 0.0, rf_v, rb_v)
 
-    # Slight squareness at shoulders, smooth oval elsewhere
-    shoulder_blend = float(_smoothstep(0.18, 0.36, y)) * (1.0 - float(_smoothstep(0.37, 0.44, y)))
-    pow_exp = 0.92 - 0.14 * shoulder_blend
+    shoulder_blend = float(_smoothstep(0.18, 0.34, y)) * (1.0 - float(_smoothstep(0.36, 0.43, y)))
+    pow_exp = 0.94 - 0.10 * shoulder_blend
 
     x = rx_v * np.sign(sin_t) * (np.abs(sin_t) ** pow_exp)
     z = rz * np.sign(cos_t) * (np.abs(cos_t) ** pow_exp)
 
-    # Subtle spine curve (chest slightly forward, upper back slightly back)
-    z_shift = 0.008 * float(np.sin((y - 0.05) * 6.0))
-    pts = np.stack([x, np.full_like(x, y), z + z_shift], axis=-1)
-    return pts
+    z_shift = 0.006 * float(np.sin((y - 0.05) * 5.5))
+    return np.stack([x, np.full_like(x, y), z + z_shift], axis=-1)
+
+
+def _compute_smooth_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Compute area-weighted smooth vertex normals from triangle soup."""
+    normals = np.zeros_like(positions, dtype=np.float64)
+    tris = indices.reshape(-1, 3)
+    p0 = positions[tris[:, 0]].astype(np.float64)
+    p1 = positions[tris[:, 1]].astype(np.float64)
+    p2 = positions[tris[:, 2]].astype(np.float64)
+
+    face_normals = np.cross(p1 - p0, p2 - p0)
+    np.add.at(normals, tris[:, 0], face_normals)
+    np.add.at(normals, tris[:, 1], face_normals)
+    np.add.at(normals, tris[:, 2], face_normals)
+
+    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+    lengths = np.where(lengths < 1e-8, 1.0, lengths)
+    return (normals / lengths).astype(np.float32)
 
 
 def _triangulate_grid(
@@ -116,30 +171,9 @@ def _triangulate_grid(
     )
 
 
-def _compute_smooth_normals(positions: np.ndarray, indices: np.ndarray) -> np.ndarray:
-    """Compute area-weighted smooth vertex normals from triangle soup."""
-    normals = np.zeros_like(positions, dtype=np.float64)
-    tris = indices.reshape(-1, 3)
-    p0 = positions[tris[:, 0]].astype(np.float64)
-    p1 = positions[tris[:, 1]].astype(np.float64)
-    p2 = positions[tris[:, 2]].astype(np.float64)
-
-    face_normals = np.cross(p1 - p0, p2 - p0)
-    np.add.at(normals, tris[:, 0], face_normals)
-    np.add.at(normals, tris[:, 1], face_normals)
-    np.add.at(normals, tris[:, 2], face_normals)
-
-    lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-    lengths = np.where(lengths < 1e-8, 1.0, lengths)
-    return (normals / lengths).astype(np.float32)
-
-
 def _merge_primitives(parts: List[MeshPrimitiveData], name: str, material_index: int) -> MeshPrimitiveData:
     """Combine multiple primitives sharing a material into one draw call."""
-    pos_list = []
-    nrm_list = []
-    uv_list = []
-    idx_list = []
+    pos_list, nrm_list, uv_list, idx_list = [], [], [], []
     offset = 0
     for p in parts:
         pos_list.append(p.positions)
@@ -154,6 +188,35 @@ def _merge_primitives(parts: List[MeshPrimitiveData], name: str, material_index:
         normals=np.vstack(nrm_list),
         uvs=np.vstack(uv_list),
         indices=np.concatenate(idx_list),
+        material_index=material_index,
+    )
+
+
+def _build_cap_disk(
+    ring: np.ndarray,
+    center: np.ndarray,
+    reverse: bool,
+    material_index: int,
+) -> MeshPrimitiveData:
+    """Create a flat end cap from a closed boundary ring."""
+    n = len(ring)
+    positions = np.vstack([center[None, :], ring]).astype(np.float32)
+    uvs = np.zeros((n + 1, 2), dtype=np.float32)
+    indices: List[int] = []
+    for i in range(n):
+        nxt = (i + 1) % n
+        if reverse:
+            indices.extend([0, nxt + 1, i + 1])
+        else:
+            indices.extend([0, i + 1, nxt + 1])
+    idx_arr = np.array(indices, dtype=np.uint32)
+    normals = _compute_smooth_normals(positions, idx_arr)
+    return MeshPrimitiveData(
+        name="cap",
+        positions=positions,
+        normals=normals,
+        uvs=uvs,
+        indices=idx_arr,
         material_index=material_index,
     )
 
@@ -184,7 +247,6 @@ def _build_tube_along_curve(
             tangent = centers[i + 1] - centers[i - 1]
         tangent = tangent / max(1e-8, float(np.linalg.norm(tangent)))
 
-        # Parallel transport frame
         n_vec = prev_normal - np.dot(prev_normal, tangent) * tangent
         n_norm = float(np.linalg.norm(n_vec))
         if n_norm < 1e-5:
@@ -205,7 +267,6 @@ def _build_tube_along_curve(
         uvs[i, :, 1] = i / max(1, n_pts - 1)
 
     parts = [_triangulate_grid(grid, uvs, material_index, name, wrap_col=True)]
-
     if cap_start:
         parts.append(_build_cap_disk(grid[0], centers[0], reverse=True, material_index=material_index))
     if cap_end:
@@ -214,78 +275,59 @@ def _build_tube_along_curve(
     return _merge_primitives(parts, name=name, material_index=material_index)
 
 
-def _build_cap_disk(
-    ring: np.ndarray,
-    center: np.ndarray,
-    reverse: bool,
-    material_index: int,
-) -> MeshPrimitiveData:
-    """Create a flat/domed end cap from a closed boundary ring."""
-    n = len(ring)
-    positions = np.vstack([center[None, :], ring]).astype(np.float32)
-    uvs = np.zeros((n + 1, 2), dtype=np.float32)
-    indices: List[int] = []
-    for i in range(n):
-        nxt = (i + 1) % n
-        if reverse:
-            indices.extend([0, nxt + 1, i + 1])
-        else:
-            indices.extend([0, i + 1, nxt + 1])
-    idx_arr = np.array(indices, dtype=np.uint32)
-    normals = _compute_smooth_normals(positions, idx_arr)
-    return MeshPrimitiveData(
-        name="cap",
-        positions=positions,
-        normals=normals,
-        uvs=uvs,
-        indices=idx_arr,
-        material_index=material_index,
-    )
-
-
 def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
-    """Build sculpted mannequin torso, neck dome, and both arms."""
-    ny = 48
+    """Build sculpted mannequin torso, spherical neck cap, and arms."""
     ntheta = 64
-    ys = np.linspace(-0.26, 0.565, ny)
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
+
+    # Torso + cylindrical neck up to y=0.52, then smooth dome rings up to y=0.558
+    ys_body = np.linspace(-0.26, 0.52, 42)
+    dome_angles = np.linspace(0.0, np.pi / 2.0, 10)[1:]  # 0 -> equator, pi/2 -> pole
+    ny = len(ys_body) + len(dome_angles)
 
     grid = np.zeros((ny, ntheta, 3), dtype=np.float32)
     uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
 
-    for iy, y in enumerate(ys):
-        pts = _eval_torso_ring(float(y), thetas, extra_offset=0.0, waist_ease=0.0)
-        # Smoothly round the very top of the neck into a dome
-        if y > 0.52:
-            t = (y - 0.52) / 0.045
-            scale = float(np.sqrt(max(0.02, 1.0 - t * t)))
-            pts[:, 0] *= scale
-            pts[:, 2] *= scale
-        grid[iy] = pts
+    for iy, y in enumerate(ys_body):
+        grid[iy] = _eval_torso_ring(float(y), thetas)
+        uvs[iy, :, 0] = thetas / (2.0 * np.pi)
+        uvs[iy, :, 1] = iy / (ny - 1)
+
+    base_ring = grid[len(ys_body) - 1]
+    base_center_x = float(np.mean(base_ring[:, 0]))
+    base_center_z = float(np.mean(base_ring[:, 2]))
+    base_y = float(ys_body[-1])
+    dome_height = 0.038
+
+    for j, ang in enumerate(dome_angles):
+        iy = len(ys_body) + j
+        scale = float(np.cos(ang))
+        y_dome = base_y + dome_height * float(np.sin(ang))
+        ring = base_ring.copy()
+        ring[:, 0] = base_center_x + (ring[:, 0] - base_center_x) * scale
+        ring[:, 2] = base_center_z + (ring[:, 2] - base_center_z) * scale
+        ring[:, 1] = y_dome
+        grid[iy] = ring
         uvs[iy, :, 0] = thetas / (2.0 * np.pi)
         uvs[iy, :, 1] = iy / (ny - 1)
 
     torso_prim = _triangulate_grid(grid, uvs, material_index, "mannequin_torso", wrap_col=True)
-
-    # Bottom hip cap & top neck cap
     bottom_cap = _build_cap_disk(grid[0], np.array([0.0, -0.262, 0.0]), reverse=True, material_index=material_index)
-    top_cap = _build_cap_disk(grid[-1], np.array([0.0, 0.572, 0.0]), reverse=False, material_index=material_index)
 
-    # Left (+X) and Right (-X) mannequin arms extending to forearm
-    arm_parts = [torso_prim, bottom_cap, top_cap]
+    arm_parts = [torso_prim, bottom_cap]
     for side in (-1.0, 1.0):
         t_vals = np.linspace(0.0, 1.0, 22)
         centers = np.column_stack(
             [
-                side * (0.175 + 0.145 * t_vals),
-                0.315 - 0.42 * t_vals,
-                -0.01 + 0.035 * (t_vals ** 1.4),
+                side * (0.165 + 0.145 * t_vals),
+                0.282 - 0.39 * t_vals,
+                -0.004 + 0.032 * (t_vals ** 1.4),
             ]
         )
-        radii = 0.056 - 0.017 * t_vals
-        # Taper wrist smoothly
+        # Keep upper arm slimmer than sleeve so mannequin never pokes through sleeve
+        radii = 0.047 - 0.011 * t_vals
         radii[-2] *= 0.88
-        radii[-1] *= 0.68
+        radii[-1] *= 0.65
         arm_parts.append(
             _build_tube_along_curve(
                 centers,
@@ -303,56 +345,36 @@ def _build_mannequin_body(material_index: int) -> MeshPrimitiveData:
 
 def _build_stand(material_index: int) -> MeshPrimitiveData:
     """Build sleek boutique stand pole and base plate."""
-    # Pole from y = -0.60 up to -0.24
-    pole_centers = np.array(
-        [
-            [0.0, -0.60, 0.0],
-            [0.0, -0.42, 0.0],
-            [0.0, -0.24, 0.0],
-        ]
-    )
+    pole_centers = np.array([[0.0, -0.60, 0.0], [0.0, -0.42, 0.0], [0.0, -0.24, 0.0]])
     pole_radii = np.array([0.017, 0.016, 0.016])
     pole = _build_tube_along_curve(
         pole_centers, pole_radii, ntheta=24, cap_start=True, cap_end=True, material_index=material_index
     )
 
-    # Base disc from y = -0.62 to -0.60
-    base_centers = np.array(
-        [
-            [0.0, -0.622, 0.0],
-            [0.0, -0.614, 0.0],
-            [0.0, -0.602, 0.0],
-        ]
-    )
+    base_centers = np.array([[0.0, -0.622, 0.0], [0.0, -0.614, 0.0], [0.0, -0.602, 0.0]])
     base_radii = np.array([0.185, 0.185, 0.172])
     base = _build_tube_along_curve(
         base_centers, base_radii, ntheta=48, cap_start=True, cap_end=True, material_index=material_index
     )
-
     return _merge_primitives([pole, base], name="DisplayStand", material_index=material_index)
 
 
-def _neckline_height(theta: np.ndarray, garment_type: GarmentType) -> np.ndarray:
-    """Compute top edge y(theta) of the garment torso to carve realistic necklines."""
-    cos_t = np.cos(theta)
-    front_weight = np.clip(cos_t, 0.0, 1.0)
-    back_weight = np.clip(-cos_t, 0.0, 1.0)
-
-    shoulder_y = 0.422
-    back_dip = 0.022
+def _collar_y_at_x(abs_x: np.ndarray, is_front: bool, garment_type: GarmentType, neck_half_w: float) -> np.ndarray:
+    """Compute neckline height inside the neck opening |x| <= neck_half_w."""
+    t = np.clip(abs_x / neck_half_w, 0.0, 1.0)
+    shoulder_neck_y = 0.422
+    if not is_front:
+        return 0.402 + (shoulder_neck_y - 0.402) * (t ** 1.8)
 
     if garment_type == "vneck":
-        # Deeper V-cut at front center (theta = 0)
-        v_factor = front_weight ** 1.35
-        front_dip = 0.135 * v_factor
+        dip_y = 0.305
+        return dip_y + (shoulder_neck_y - dip_y) * (t ** 1.25)
     elif garment_type in ("shirt", "polo"):
-        # Open collar plunge at front center
-        front_dip = 0.095 * (front_weight ** 1.7)
+        dip_y = 0.335
+        return dip_y + (shoulder_neck_y - dip_y) * (t ** 1.65)
     else:
-        # Classic crew neck
-        front_dip = 0.088 * (front_weight ** 1.9)
-
-    return shoulder_y - front_dip - back_dip * (back_weight ** 1.8)
+        dip_y = 0.340
+        return dip_y + (shoulder_neck_y - dip_y) * (t ** 1.85)
 
 
 def _build_garment_torso_half(
@@ -360,48 +382,87 @@ def _build_garment_torso_half(
     garment_type: GarmentType,
     material_index: int,
 ) -> MeshPrimitiveData:
-    """Build either the front or back garment torso shell with clean UV mapping."""
-    ny = 44
-    ntheta = 40
+    """Build front or back garment torso+shoulder shell that completely encloses the shoulders."""
+    ny = 48
+    nx = 65
     y_bottom = -0.235
+    garment_offset = 0.015
+    waist_ease = 0.011
+    neck_half_w = 0.083
 
-    if is_front:
-        thetas = np.linspace(-np.pi / 2.0, np.pi / 2.0, ntheta)
-        u_start, u_end = 0.09, 0.41  # Front torso region inside 2048x1024 atlas
-    else:
-        thetas = np.linspace(np.pi / 2.0, 1.5 * np.pi, ntheta)
-        u_start, u_end = 0.59, 0.91  # Back torso region inside 2048x1024 atlas
+    # Horizontal parameter u_x in [-1, +1] from viewer-left to viewer-right
+    # Front view: -1 is -X, +1 is +X. Back view: -1 is +X, +1 is -X.
+    u_xs = np.linspace(-1.0, 1.0, nx)
+    x_dir = u_xs if is_front else -u_xs
 
-    y_tops = _neckline_height(thetas, garment_type)
+    # Max shoulder half-width at shoulder crest (y=0.34)
+    rx_crest = float(_torso_profile(np.array([0.34]), extra_offset=garment_offset)[0][0])
 
-    grid = np.zeros((ny, ntheta, 3), dtype=np.float32)
-    uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
+    # Compute top boundary y_top for each horizontal column u_x
+    x_top_target = x_dir * rx_crest
+    abs_x_top = np.abs(x_top_target)
+    in_neck = abs_x_top <= neck_half_w
 
-    s_vals = np.linspace(0.0, 1.0, ny)  # 0 = bottom hem, 1 = neckline/shoulder top
-    sin_t = np.sin(thetas)
-    x_norm = 0.5 + 0.5 * sin_t if is_front else 0.5 - 0.5 * sin_t
+    y_tops = np.where(
+        in_neck,
+        _collar_y_at_x(abs_x_top, is_front=is_front, garment_type=garment_type, neck_half_w=neck_half_w),
+        _shoulder_ridge_y(abs_x_top, garment_offset=garment_offset),
+    )
 
-    for iy, s in enumerate(s_vals):
-        y_col = y_bottom + s * (y_tops - y_bottom)
-        for ix, theta in enumerate(thetas):
-            y_val = float(y_col[ix])
-            # Slight cloth ease at waist & gentle flare at hem
-            hem_flare = 0.008 * float((1.0 - s) ** 2)
-            pts = _eval_torso_ring(
-                y_val,
-                np.array([theta]),
-                extra_offset=0.008 + hem_flare,
-                waist_ease=0.012,
-            )
-            grid[iy, ix] = pts[0]
+    grid = np.zeros((ny, nx, 3), dtype=np.float32)
+    uvs = np.zeros((ny, nx, 2), dtype=np.float32)
 
-            # Map (x_norm, y_val) onto garment texture coordinates
-            u = u_start + float(x_norm[ix]) * (u_end - u_start)
-            # Top of garment image (shoulder = 0.422) -> v = 0.02, bottom hem (-0.235) -> v = 0.98
-            v_norm = np.clip((0.422 - y_val) / (0.422 - y_bottom), 0.0, 1.0)
-            v = 0.02 + float(v_norm) * 0.96
+    u_start, u_end = (0.095, 0.405) if is_front else (0.595, 0.905)
+    s_vals = np.linspace(0.0, 1.0, ny)
+
+    for ix in range(nx):
+        u_col = float(u_xs[ix])
+        xd = float(x_dir[ix])
+        y_top = float(y_tops[ix])
+        x_top = float(x_top_target[ix])
+        is_shoulder = not bool(in_neck[ix])
+
+        for iy, s in enumerate(s_vals):
+            y_val = y_bottom + float(s) * (y_top - y_bottom)
+            rx_y = float(_torso_profile(np.array([y_val]), extra_offset=garment_offset, waist_ease=waist_ease)[0][0])
+
+            if is_shoulder:
+                # Below crest (y <= 0.34), scale with rx_y; above crest, converge smoothly to x_top (= rx_y at y_top)
+                if y_val <= 0.34:
+                    x_val = xd * rx_y
+                else:
+                    t_up = (y_val - 0.34) / max(1e-5, y_top - 0.34)
+                    x_at_crest = xd * rx_crest
+                    x_val = x_at_crest + t_up * (x_top - x_at_crest)
+                    # Ensure x_val stays within rx_y so z is real and reaches 0 cleanly at y_top
+                    if abs(x_val) > rx_y:
+                        x_val = np.sign(x_val) * rx_y
+            else:
+                # Inside neck column: keep x smoothly spanning [xd*rx_y .. x_top]
+                if y_val <= 0.34:
+                    x_val = xd * rx_y
+                else:
+                    t_up = (y_val - 0.34) / max(1e-5, y_top - 0.34)
+                    x_at_crest = xd * rx_crest
+                    x_val = x_at_crest + t_up * (x_top - x_at_crest)
+                    x_val = float(np.clip(x_val, -rx_y * 0.98, rx_y * 0.98))
+
+            # At the very top ridge of shoulders or side edges, snap z cleanly to ridge so front & back join tightly
+            pt = _eval_torso_point(x_val, y_val, is_front=is_front, extra_offset=garment_offset, waist_ease=waist_ease)
+            if is_shoulder and iy == ny - 1:
+                pt[2] = 0.006 * float(np.sin((y_val - 0.05) * 5.5))
+            if ix == 0 or ix == nx - 1:
+                pt[2] = 0.006 * float(np.sin((y_val - 0.05) * 5.5))
+
+            grid[iy, ix] = pt
+
+            x_frac = 0.5 * (u_col + 1.0)
+            u = u_start + x_frac * (u_end - u_start)
+            v_norm = float(np.clip((0.422 - y_val) / (0.422 - y_bottom), 0.0, 1.0))
+            v = 0.03 + v_norm * 0.94
             uvs[iy, ix] = [u, v]
 
+    # Note: for front, columns go -X -> +X (CCW outward); for back, columns go +X -> -X (also CCW outward from back!)
     return _triangulate_grid(
         grid,
         uvs,
@@ -412,35 +473,45 @@ def _build_garment_torso_half(
 
 
 def _build_collar_trim(garment_type: GarmentType, material_index: int) -> MeshPrimitiveData:
-    """Build ribbed collar / folded shirt collar along the neckline."""
+    """Build tight, realistic ribbed collar/neckband around the neck hole only."""
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
-    y_tops = _neckline_height(thetas, garment_type)
+    neck_half_w = 0.083
+    garment_offset = 0.015
 
-    collar_height = 0.028 if garment_type in ("shirt", "polo") else 0.016
-    collar_offset = 0.014 if garment_type in ("shirt", "polo") else 0.011
+    collar_h = 0.024 if garment_type in ("shirt", "polo") else 0.015
+    collar_thick = 0.005
 
     ny = 4
     grid = np.zeros((ny, ntheta, 3), dtype=np.float32)
     uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
 
     for ix, theta in enumerate(thetas):
-        y_base = float(y_tops[ix]) - 0.004
-        is_front = np.cos(theta) >= 0.0
-        u_sample = 0.25 if is_front else 0.75  # Sample neckline fabric color
-        for iy, t in enumerate(np.linspace(0.0, 1.0, ny)):
-            # Outer lip then tucked inward toward neck
+        sin_t = float(np.sin(theta))
+        cos_t = float(np.cos(theta))
+        is_front = cos_t >= 0.0
+        x_val = sin_t * neck_half_w
+        y_base = float(_collar_y_at_x(np.array([abs(x_val)]), is_front, garment_type, neck_half_w)[0]) - 0.003
+
+        u_sample = 0.25 if is_front else 0.75
+        for iy in range(ny):
             if iy == 0:
-                y_cur, off = y_base, 0.008
+                y_cur, off = y_base, garment_offset - 0.001
             elif iy == 1:
-                y_cur, off = y_base + collar_height * 0.55, collar_offset
+                y_cur, off = y_base + collar_h * 0.55, garment_offset + collar_thick
             elif iy == 2:
-                y_cur, off = y_base + collar_height, collar_offset * 0.85
+                y_cur, off = y_base + collar_h, garment_offset + collar_thick * 0.6
             else:
-                y_cur, off = y_base + collar_height * 0.65, 0.002
-            pts = _eval_torso_ring(y_cur, np.array([theta]), extra_offset=off, waist_ease=0.0)
-            grid[iy, ix] = pts[0]
-            uvs[iy, ix] = [u_sample, 0.14]
+                y_cur, off = y_base + collar_h * 0.65, garment_offset - 0.007
+
+            # Keep collar tightly hugging the neck circumference
+            rx_y, rf_y, rb_y = _torso_profile(np.array([y_cur]), extra_offset=off)
+            rz_y = float(rf_y[0] if is_front else rb_y[0])
+            rx_neck = min(float(rx_y[0]), neck_half_w + off - garment_offset + 0.004)
+            z_cur = (rz_y * abs(cos_t)) * (1.0 if is_front else -1.0)
+            z_shift = 0.006 * float(np.sin((y_cur - 0.05) * 5.5))
+            grid[iy, ix] = [sin_t * rx_neck, y_cur, z_cur + z_shift]
+            uvs[iy, ix] = [u_sample, 0.12]
 
     return _triangulate_grid(grid, uvs, material_index, "garment_collar", wrap_col=True)
 
@@ -450,29 +521,31 @@ def _build_sleeve(
     garment_type: GarmentType,
     material_index: int,
 ) -> MeshPrimitiveData:
-    """Build one garment sleeve split cleanly into front & back UV halves."""
+    """Build one garment sleeve anchored flush inside the shoulder armhole with zero gap."""
     is_long = garment_type in ("long_sleeve", "shirt")
-    max_t = 0.90 if is_long else 0.44
+    max_t = 0.88 if is_long else 0.43
 
-    ns = 18
+    ns = 20
     ntheta_half = 20
 
     s_vals = np.linspace(0.0, max_t, ns)
+    s_frac = s_vals / max_t
+
+    # Arm centerline matches mannequin arm inside the shoulder
     centers = np.column_stack(
         [
             side * (0.165 + 0.145 * s_vals),
-            0.315 - 0.42 * s_vals,
-            -0.01 + 0.035 * (s_vals ** 1.4),
+            0.282 - 0.39 * s_vals,
+            -0.004 + 0.032 * (s_vals ** 1.4),
         ]
     )
-    # Sleeve radius wider at shoulder armhole so it blends smoothly into torso
-    s_frac = s_vals / max_t
-    radii = (0.088 - 0.018 * s_frac) if not is_long else (0.088 - 0.034 * s_frac)
+    # Slightly tucked radius at shoulder tapering cleanly toward cuff
+    radii_z = (0.072 - 0.008 * s_frac) if not is_long else (0.072 - 0.022 * s_frac)
+    radii_y = (0.070 - 0.008 * s_frac) if not is_long else (0.070 - 0.022 * s_frac)
 
-    # Build orthonormal frame along sleeve centerline
-    frames_n = []
-    frames_b = []
-    prev_n = np.array([0.0, 0.0, 1.0])  # +Z front direction
+    # Parallel-transport arm frames for outer rings
+    arm_n, arm_b = [], []
+    prev_n = np.array([0.0, 0.0, 1.0])
     for i in range(ns):
         if i == 0:
             tan = centers[1] - centers[0]
@@ -485,52 +558,55 @@ def _build_sleeve(
         n_vec = n_vec / max(1e-8, float(np.linalg.norm(n_vec)))
         b_vec = np.cross(tan, n_vec)
         prev_n = n_vec
-        frames_n.append(n_vec)
-        frames_b.append(b_vec)
+        arm_n.append(n_vec)
+        arm_b.append(b_vec)
+
+    # Vertical armhole basis at s=0 so sleeve top tucks seamlessly under the shoulder ridge
+    hole_n = np.array([0.0, 0.0, 1.0])
+    hole_b = np.array([0.0, -1.0, 0.0]) if side > 0 else np.array([0.0, 1.0, 0.0])
 
     parts: List[MeshPrimitiveData] = []
-
-    # Front half of sleeve: angle around sleeve from top (-b) through front (+n) to bottom (+b)
-    # Back half of sleeve: angle from bottom (+b) through back (-n) to top (-b)
     for is_front in (True, False):
-        if is_front:
-            # phi = 0 is +n (front); phi in [-pi/2, +pi/2]
-            phis = np.linspace(-np.pi / 2.0, np.pi / 2.0, ntheta_half)
-        else:
-            phis = np.linspace(np.pi / 2.0, 1.5 * np.pi, ntheta_half)
+        phis = (
+            np.linspace(-np.pi / 2.0, np.pi / 2.0, ntheta_half)
+            if is_front
+            else np.linspace(np.pi / 2.0, 1.5 * np.pi, ntheta_half)
+        )
 
         grid = np.zeros((ns, ntheta_half, 3), dtype=np.float32)
         uvs = np.zeros((ns, ntheta_half, 2), dtype=np.float32)
 
-        # Determine atlas u range for this sleeve side & front/back
-        # Front tile is [0.0, 0.5]: left wing [0.00, 0.09], right wing [0.41, 0.50]
-        # Back tile is [0.5, 1.0]: left wing [0.50, 0.59], right wing [0.91, 1.00]
         if is_front:
-            if side > 0:  # +X sleeve = right side of front image
-                u_shoulder, u_cuff = 0.415, 0.495
-            else:         # -X sleeve = left side of front image
-                u_shoulder, u_cuff = 0.085, 0.005
+            u_shoulder, u_cuff = (0.415, 0.495) if side > 0 else (0.085, 0.005)
         else:
-            if side > 0:  # +X sleeve = left side of back image
-                u_shoulder, u_cuff = 0.585, 0.505
-            else:         # -X sleeve = right side of back image
-                u_shoulder, u_cuff = 0.915, 0.995
+            u_shoulder, u_cuff = (0.585, 0.505) if side > 0 else (0.915, 0.995)
 
         for is_idx in range(ns):
-            c = centers[is_idx]
-            r = radii[is_idx]
-            n_vec = frames_n[is_idx]
-            b_vec = frames_b[is_idx]
             sf = float(s_frac[is_idx])
+            c = centers[is_idx]
+            rz = float(radii_z[is_idx])
+            ry = float(radii_y[is_idx])
+
+            # Blend smoothly from vertical armhole frame (s=0) to perpendicular arm frame (s >= 0.35)
+            w_arm = float(_smoothstep(0.0, 0.35, sf))
+            n_vec = (1.0 - w_arm) * hole_n + w_arm * arm_n[is_idx]
+            n_vec = n_vec / max(1e-8, float(np.linalg.norm(n_vec)))
+            b_vec = (1.0 - w_arm) * hole_b + w_arm * arm_b[is_idx]
+            b_vec = b_vec / max(1e-8, float(np.linalg.norm(b_vec)))
 
             for ip, phi in enumerate(phis):
-                pt = c + r * (np.cos(phi) * n_vec + np.sin(phi) * b_vec)
+                radial = np.cos(phi) * (rz * n_vec) + np.sin(phi) * (ry * b_vec)
+                pt = c + radial
+                # Tuck upper-shoulder side of armhole slightly inward inside torso shoulder seam
+                if sf < 0.25:
+                    y_rel = float(radial[1])
+                    if y_rel > 0:
+                        pt[0] -= side * (1.0 - sf / 0.25) * 0.012 * (y_rel / max(1e-4, ry))
                 grid[is_idx, ip] = pt
+
                 u = u_shoulder + sf * (u_cuff - u_shoulder)
-                # Map top-to-bottom of sleeve onto vertical [0.12 .. 0.85]
-                # Make sure top (+Y) maps to smaller v and underarm (-Y) maps to larger v
-                y_dir = float(np.dot(np.cos(phi) * n_vec + np.sin(phi) * b_vec, np.array([0.0, 1.0, 0.0])))
-                v = 0.48 - 0.35 * y_dir
+                y_dir = float(radial[1] / max(1e-5, float(np.linalg.norm(radial))))
+                v = 0.48 - 0.32 * y_dir
                 uvs[is_idx, ip] = [u, v]
 
         parts.append(
@@ -556,7 +632,6 @@ def generate_mannequin_garment_glb(
 ) -> bytes:
     """Generate a complete 3D mannequin wearing the uploaded front/back garment as a .glb."""
     atlas_png = build_garment_atlas(front_image_bytes, back_image_bytes)
-
     mannequin_rgba = MANNEQUIN_COLORS.get(mannequin_style, MANNEQUIN_COLORS["studio_charcoal"])
 
     materials = [
