@@ -43,56 +43,65 @@ _BODY_PROFILES: Dict[str, _BodyProfile] = {
     "male": _BodyProfile(
         rx_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.152, 0.154, 0.144, 0.140, 0.164, 0.172, 0.168, 0.130, 0.086, 0.054, 0.047]),
+            np.array([0.152, 0.153, 0.147, 0.145, 0.172, 0.180, 0.176, 0.136, 0.090, 0.057, 0.050]),
             extrapolate=True,
         ),
         rf_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.094, 0.095, 0.089, 0.088, 0.112, 0.106, 0.088, 0.076, 0.063, 0.051, 0.047]),
+            np.array([0.094, 0.095, 0.090, 0.090, 0.115, 0.110, 0.090, 0.078, 0.065, 0.053, 0.049]),
             extrapolate=True,
         ),
         rb_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.090, 0.091, 0.085, 0.083, 0.098, 0.095, 0.085, 0.074, 0.062, 0.050, 0.047]),
+            np.array([0.090, 0.091, 0.086, 0.085, 0.101, 0.098, 0.087, 0.076, 0.064, 0.052, 0.049]),
             extrapolate=True,
         ),
-        arm_x_start=0.145,
-        arm_x_span=0.098,
-        arm_r_start=0.038,
-        arm_r_taper=0.014,
-        sleeve_rz=0.060,
-        sleeve_ry=0.056,
-        y_crest=0.352,
+        arm_x_start=0.152,
+        arm_x_span=0.102,
+        arm_r_start=0.041,
+        arm_r_taper=0.015,
+        sleeve_rz=0.062,
+        sleeve_ry=0.058,
+        y_crest=0.354,
     ),
     "female": _BodyProfile(
         rx_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.156, 0.152, 0.126, 0.118, 0.145, 0.150, 0.146, 0.115, 0.076, 0.046, 0.041]),
+            np.array([0.166, 0.160, 0.122, 0.110, 0.142, 0.144, 0.140, 0.108, 0.072, 0.044, 0.039]),
             extrapolate=True,
         ),
         rf_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.096, 0.094, 0.080, 0.078, 0.116, 0.098, 0.082, 0.070, 0.057, 0.045, 0.041]),
+            np.array([0.100, 0.096, 0.076, 0.072, 0.110, 0.092, 0.078, 0.066, 0.054, 0.042, 0.039]),
             extrapolate=True,
         ),
         rb_spline=PchipInterpolator(
             _KNOTS_Y,
-            np.array([0.094, 0.092, 0.078, 0.076, 0.092, 0.090, 0.080, 0.068, 0.056, 0.044, 0.041]),
+            np.array([0.102, 0.098, 0.078, 0.074, 0.088, 0.086, 0.076, 0.065, 0.053, 0.041, 0.039]),
             extrapolate=True,
         ),
-        arm_x_start=0.126,
-        arm_x_span=0.088,
-        arm_r_start=0.032,
-        arm_r_taper=0.012,
-        sleeve_rz=0.052,
-        sleeve_ry=0.049,
-        y_crest=0.348,
+        arm_x_start=0.122,
+        arm_x_span=0.085,
+        arm_r_start=0.030,
+        arm_r_taper=0.011,
+        sleeve_rz=0.050,
+        sleeve_ry=0.047,
+        y_crest=0.346,
     ),
 }
 
 
 def _get_profile(gender: MannequinGender) -> _BodyProfile:
     return _BODY_PROFILES.get(gender, _BODY_PROFILES["male"])
+
+
+def _female_bust_bump(x: np.ndarray | float, y: float) -> np.ndarray | float:
+    """Smooth bilateral bust projection for female mannequin & garment front surface."""
+    bust_y = float(np.exp(-((y - 0.185) / 0.062) ** 2))
+    if bust_y < 1e-4:
+        return 0.0 * x if isinstance(x, np.ndarray) else 0.0
+    bust_x = np.exp(-((np.abs(x) - 0.054) / 0.044) ** 2)
+    return 0.036 * bust_y * bust_x
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray | float) -> np.ndarray | float:
@@ -114,7 +123,8 @@ def _torso_profile(
     rb = prof.rb_spline(y_clamped)
 
     if extra_offset != 0.0 or waist_ease != 0.0:
-        ease = extra_offset + waist_ease * np.exp(-((y - 0.0) / 0.16) ** 2)
+        eff_ease = waist_ease * (0.35 if gender == "female" else 1.0)
+        ease = extra_offset + eff_ease * np.exp(-((y - 0.0) / 0.16) ** 2)
         rx = rx + ease
         rf = rf + ease
         rb = rb + ease
@@ -188,6 +198,8 @@ def _eval_torso_point(
 
     p_inv = 2.0 / pow_exp
     z_mag = rz * (max(0.0, 1.0 - (u ** p_inv)) ** (1.0 / p_inv))
+    if is_front and gender == "female":
+        z_mag += float(_female_bust_bump(x_clamped, y))
     z = z_mag if is_front else -z_mag
 
     z_shift = 0.005 * float(np.sin((y - 0.05) * 5.5))
@@ -218,6 +230,9 @@ def _eval_torso_ring(
 
     x = rx_v * np.sign(sin_t) * (np.abs(sin_t) ** pow_exp)
     z = rz * np.sign(cos_t) * (np.abs(cos_t) ** pow_exp)
+    if gender == "female":
+        bust = _female_bust_bump(x, y)
+        z = np.where(cos_t >= 0.0, z + bust, z)
 
     z_shift = 0.005 * float(np.sin((y - 0.05) * 5.5))
     return np.stack([x, np.full_like(x, y), z + z_shift], axis=-1)
