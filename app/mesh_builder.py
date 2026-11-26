@@ -9,9 +9,9 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from app.glb_writer import MaterialSpec, MeshPrimitiveData, write_glb
-from app.texture_processor import build_garment_atlas_with_meta
+from app.texture_processor import build_garment_atlas_with_meta, build_trousers_atlas_with_meta
 
-GarmentType = Literal["tshirt", "vneck", "long_sleeve", "shirt", "polo"]
+GarmentType = Literal["tshirt", "vneck", "long_sleeve", "shirt", "polo", "trousers", "shorts"]
 MannequinStyle = Literal["studio_charcoal", "matte_white", "warm_beige", "matte_black"]
 MannequinGender = Literal["male", "female"]
 
@@ -770,6 +770,213 @@ def _build_sleeve(
     return _merge_primitives(parts, name="garment_sleeve", material_index=material_index)
 
 
+def _build_lower_mannequin_body(
+    material_index: int, gender: MannequinGender = "male"
+) -> MeshPrimitiveData:
+    """Build sculpted lower-body mannequin (waist, pelvis, and two legs) for trousers/shorts."""
+    is_fem = gender == "female"
+    y_knots = np.array([0.14, 0.22, 0.30, 0.38, 0.44, 0.50])
+    rx_vals = (
+        np.array([0.148, 0.172, 0.166, 0.126, 0.120, 0.124])
+        if is_fem
+        else np.array([0.144, 0.160, 0.158, 0.144, 0.142, 0.144])
+    )
+    rf_vals = (
+        np.array([0.090, 0.104, 0.100, 0.080, 0.078, 0.080])
+        if is_fem
+        else np.array([0.088, 0.098, 0.096, 0.090, 0.089, 0.090])
+    )
+    rb_vals = (
+        np.array([0.100, 0.114, 0.106, 0.082, 0.079, 0.080])
+        if is_fem
+        else np.array([0.092, 0.102, 0.098, 0.089, 0.088, 0.089])
+    )
+
+    rx_sp = PchipInterpolator(y_knots, rx_vals, extrapolate=True)
+    rf_sp = PchipInterpolator(y_knots, rf_vals, extrapolate=True)
+    rb_sp = PchipInterpolator(y_knots, rb_vals, extrapolate=True)
+
+    ntheta = 64
+    thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
+    ys_pelvis = np.linspace(0.14, 0.50, 24)
+    ny = len(ys_pelvis)
+    grid = np.zeros((ny, ntheta, 3), dtype=np.float32)
+    uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
+
+    for iy, y in enumerate(ys_pelvis):
+        rx = float(rx_sp(y))
+        rf = float(rf_sp(y))
+        rb = float(rb_sp(y))
+        cos_t = np.cos(thetas)
+        sin_t = np.sin(thetas)
+        rz = np.where(sin_t >= 0.0, rf, rb)
+        grid[iy, :, 0] = rx * cos_t
+        grid[iy, :, 1] = float(y)
+        grid[iy, :, 2] = rz * sin_t
+        uvs[iy, :, 0] = thetas / (2.0 * np.pi)
+        uvs[iy, :, 1] = iy / max(1, ny - 1)
+
+    pelvis_prim = _triangulate_grid(grid, uvs, material_index, "mannequin_pelvis", wrap_col=True)
+    top_cap = _build_cap_disk(grid[-1], np.array([0.0, 0.506, 0.0]), reverse=False, material_index=material_index)
+    bot_cap = _build_cap_disk(grid[0], np.array([0.0, 0.136, 0.0]), reverse=True, material_index=material_index)
+    parts = [pelvis_prim, top_cap, bot_cap]
+
+    # Left & right mannequin legs
+    for side in (-1.0, 1.0):
+        t_vals = np.linspace(0.0, 1.0, 32)
+        y_leg = 0.22 - t_vals * 0.78  # 0.22 -> -0.56
+        x_leg = side * (0.084 + 0.010 * t_vals)
+        z_leg = 0.006 * np.sin(np.pi * t_vals) - 0.008 * (t_vals ** 2)
+        centers = np.stack([x_leg, y_leg, z_leg], axis=1)
+
+        r_thigh = 0.084 if is_fem else 0.080
+        r_knee = 0.056
+        r_ankle = 0.041
+        radii = np.interp(t_vals, [0.0, 0.45, 0.72, 1.0], [r_thigh, r_knee, 0.052, r_ankle])
+        parts.append(
+            _build_tube_along_curve(
+                centers,
+                radii,
+                ntheta=32,
+                cap_start=True,
+                cap_end=True,
+                material_index=material_index,
+                name="mannequin_leg",
+            )
+        )
+
+    return _merge_primitives(parts, name="Mannequin", material_index=material_index)
+
+
+def _build_trousers_mesh(
+    is_shorts: bool,
+    material_index: int,
+    gender: MannequinGender = "male",
+) -> MeshPrimitiveData:
+    """Build procedural 3D trousers or shorts (hip/waistband shell + left/right leg tubes)."""
+    is_fem = gender == "female"
+    ease = 0.013
+
+    # Match hip outer width at y=0.16 to leg outer edge (x_center + r_thigh) for a flush join
+    r_thigh = (0.084 if is_fem else 0.080) + 0.013
+    x_leg_0 = 0.084
+    x_hip_leg_outer = x_leg_0 + r_thigh
+
+    # 1. Hip / waistband shell (y = 0.16 .. 0.44), morphing smoothly into the two-leg figure-8 at y=0.16
+    y_knots = np.array([0.16, 0.23, 0.30, 0.38, 0.44])
+    rx_vals = (
+        np.array([x_hip_leg_outer, x_hip_leg_outer * 1.01, 0.172 + ease, 0.130 + ease, 0.123 + ease])
+        if is_fem
+        else np.array([x_hip_leg_outer, x_hip_leg_outer * 1.01, 0.165 + ease, 0.146 + ease, 0.144 + ease])
+    )
+    rf_vals = (
+        np.array([r_thigh, r_thigh * 1.04, 0.104 + ease, 0.082 + ease, 0.080 + ease])
+        if is_fem
+        else np.array([r_thigh, r_thigh * 1.03, 0.100 + ease, 0.092 + ease, 0.091 + ease])
+    )
+    rb_vals = (
+        np.array([r_thigh, r_thigh * 1.06, 0.114 + ease, 0.084 + ease, 0.081 + ease])
+        if is_fem
+        else np.array([r_thigh, r_thigh * 1.04, 0.104 + ease, 0.091 + ease, 0.090 + ease])
+    )
+    rx_sp = PchipInterpolator(y_knots, rx_vals, extrapolate=True)
+    rf_sp = PchipInterpolator(y_knots, rf_vals, extrapolate=True)
+    rb_sp = PchipInterpolator(y_knots, rb_vals, extrapolate=True)
+
+    parts: List[MeshPrimitiveData] = []
+    ys_hip = np.linspace(0.44, 0.16, 20)
+    nx_hip = 48
+
+    for is_front in (True, False):
+        u_start, u_end = (0.0, 0.5) if is_front else (0.5, 1.0)
+        z_sign = 1.0 if is_front else -1.0
+        grid = np.zeros((len(ys_hip), nx_hip, 3), dtype=np.float32)
+        uvs = np.zeros((len(ys_hip), nx_hip, 2), dtype=np.float32)
+
+        for iy, y in enumerate(ys_hip):
+            rx = float(rx_sp(y))
+            rz = float(rf_sp(y) if is_front else rb_sp(y))
+            # Distribute x from -rx to +rx for front, +rx to -rx for back (matches leg UV orientation & winding)
+            t_x = np.linspace(-1.0, 1.0, nx_hip) if is_front else np.linspace(1.0, -1.0, nx_hip)
+            x_cos = rx * np.sin(t_x * (np.pi / 2.0))
+            x_lin = t_x * rx
+            morph = float(_smoothstep(0.32, 0.16, y))
+            x_row = (1.0 - morph) * x_cos + morph * x_lin
+
+            z_ellipse = rz * np.sqrt(np.maximum(0.0, 1.0 - (x_row / max(1e-5, rx)) ** 2))
+            # Exact two-leg figure-8 z profile at y=0.16
+            dx_leg = np.abs(x_row) - x_leg_0
+            z_two_legs = np.sqrt(np.maximum(0.0, r_thigh ** 2 - dx_leg ** 2))
+            z_row = z_sign * ((1.0 - morph) * z_ellipse + morph * z_two_legs)
+
+            grid[iy, :, 0] = x_row
+            grid[iy, :, 1] = float(y)
+            grid[iy, :, 2] = z_row
+
+            x_frac = np.linspace(0.0, 1.0, nx_hip)
+            uvs[iy, :, 0] = u_start + x_frac * (u_end - u_start)
+            uvs[iy, :, 1] = 0.02 + (iy / max(1, len(ys_hip) - 1)) * 0.26
+
+        parts.append(
+            _triangulate_grid(
+                grid,
+                uvs,
+                material_index,
+                "trousers_hip_front" if is_front else "trousers_hip_back",
+                wrap_col=False,
+            )
+        )
+
+    # 2. Left & right leg tubes starting seamlessly at y=0.16
+    y_leg_top = 0.16
+    y_leg_bot = -0.04 if is_shorts else -0.50
+    ny_leg = 14 if is_shorts else 28
+    nx_leg = 24
+    t_vals = np.linspace(0.0, 1.0, ny_leg)
+    y_leg = y_leg_top + t_vals * (y_leg_bot - y_leg_top)
+    depth_frac = (y_leg_top - y_leg) / 0.66
+
+    for side in (-1.0, 1.0):
+        x_center = side * (x_leg_0 + 0.010 * depth_frac)
+        z_center = 0.005 * np.sin(np.pi * depth_frac) - 0.006 * (depth_frac ** 2)
+        r_knee = 0.072
+        r_hem = 0.064
+        radii = np.interp(depth_frac, [0.0, 0.48, 1.0], [r_thigh, r_knee, r_hem])
+
+        for is_front in (True, False):
+            # Front tile: u in [0.0, 0.5]; Back tile: u in [0.5, 1.0]
+            # Left leg (side=-1) occupies left half of tile; Right leg (side=+1) occupies right half
+            tile_base = 0.0 if is_front else 0.5
+            leg_u0 = tile_base + (0.0 if side < 0 else 0.25)
+            leg_u1 = leg_u0 + 0.25
+
+            thetas = np.linspace(np.pi, 0.0, nx_leg) if is_front else np.linspace(0.0, -np.pi, nx_leg)
+            grid = np.zeros((ny_leg, nx_leg, 3), dtype=np.float32)
+            uvs = np.zeros((ny_leg, nx_leg, 2), dtype=np.float32)
+
+            for iy in range(ny_leg):
+                r = float(radii[iy])
+                grid[iy, :, 0] = x_center[iy] + r * np.cos(thetas)
+                grid[iy, :, 1] = y_leg[iy]
+                grid[iy, :, 2] = z_center[iy] + r * np.sin(thetas)
+
+                x_frac = np.linspace(0.0, 1.0, nx_leg)
+                uvs[iy, :, 0] = leg_u0 + x_frac * (leg_u1 - leg_u0)
+                uvs[iy, :, 1] = 0.28 + (iy / max(1, ny_leg - 1)) * 0.70
+
+            parts.append(
+                _triangulate_grid(
+                    grid,
+                    uvs,
+                    material_index,
+                    "trousers_leg",
+                    wrap_col=False,
+                )
+            )
+
+    return _merge_primitives(parts, name="Garment", material_index=material_index)
+
+
 def generate_mannequin_garment_glb(
     front_image_bytes: bytes,
     back_image_bytes: bytes,
@@ -779,16 +986,21 @@ def generate_mannequin_garment_glb(
     include_stand: bool = False,
 ) -> bytes:
     """Generate a complete 3D mannequin wearing the uploaded front/back garment as a .glb."""
-    atlas_png, is_long_sleeve, torso_aspect = build_garment_atlas_with_meta(
-        front_image_bytes, back_image_bytes
-    )
-    effective_type: GarmentType = garment_type or ("long_sleeve" if is_long_sleeve else "tshirt")
-    # Preserve cropped vs full-length silhouette based on measured torso aspect ratio
-    y_bottom = (
-        -0.205
-        if torso_aspect >= 1.45
-        else float(np.interp(torso_aspect, [0.85, 1.45], [0.05, -0.205]))
-    )
+    is_lower_body = garment_type in ("trousers", "shorts")
+    if is_lower_body:
+        atlas_png, detected_shorts = build_trousers_atlas_with_meta(front_image_bytes, back_image_bytes)
+        is_shorts = True if garment_type == "shorts" else detected_shorts
+    else:
+        atlas_png, is_long_sleeve, torso_aspect = build_garment_atlas_with_meta(
+            front_image_bytes, back_image_bytes
+        )
+        effective_type: GarmentType = garment_type or ("long_sleeve" if is_long_sleeve else "tshirt")
+        # Preserve cropped vs full-length silhouette based on measured torso aspect ratio
+        y_bottom = (
+            -0.205
+            if torso_aspect >= 1.45
+            else float(np.interp(torso_aspect, [0.85, 1.45], [0.05, -0.205]))
+        )
     mannequin_rgba = MANNEQUIN_COLORS.get(mannequin_style, MANNEQUIN_COLORS["studio_charcoal"])
 
     materials = [
@@ -818,27 +1030,33 @@ def generate_mannequin_garment_glb(
         ),
     ]
 
-    mannequin_mesh = _build_mannequin_body(material_index=0, gender=mannequin_gender)
-    garment_parts = [
-        _build_garment_torso_half(
-            is_front=True,
-            garment_type=effective_type,
-            material_index=1,
-            gender=mannequin_gender,
-            y_bottom=y_bottom,
-        ),
-        _build_garment_torso_half(
-            is_front=False,
-            garment_type=effective_type,
-            material_index=1,
-            gender=mannequin_gender,
-            y_bottom=y_bottom,
-        ),
-        _build_collar_trim(garment_type=effective_type, material_index=1, gender=mannequin_gender),
-        _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
-        _build_sleeve(side=1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
-    ]
-    garment_mesh = _merge_primitives(garment_parts, name="Garment", material_index=1)
+    if is_lower_body:
+        mannequin_mesh = _build_lower_mannequin_body(material_index=0, gender=mannequin_gender)
+        garment_mesh = _build_trousers_mesh(
+            is_shorts=is_shorts, material_index=1, gender=mannequin_gender
+        )
+    else:
+        mannequin_mesh = _build_mannequin_body(material_index=0, gender=mannequin_gender)
+        garment_parts = [
+            _build_garment_torso_half(
+                is_front=True,
+                garment_type=effective_type,
+                material_index=1,
+                gender=mannequin_gender,
+                y_bottom=y_bottom,
+            ),
+            _build_garment_torso_half(
+                is_front=False,
+                garment_type=effective_type,
+                material_index=1,
+                gender=mannequin_gender,
+                y_bottom=y_bottom,
+            ),
+            _build_collar_trim(garment_type=effective_type, material_index=1, gender=mannequin_gender),
+            _build_sleeve(side=-1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
+            _build_sleeve(side=1.0, garment_type=effective_type, material_index=1, gender=mannequin_gender),
+        ]
+        garment_mesh = _merge_primitives(garment_parts, name="Garment", material_index=1)
 
     primitives = [mannequin_mesh, garment_mesh]
     if include_stand:

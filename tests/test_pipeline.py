@@ -14,7 +14,12 @@ from PIL import Image, ImageDraw
 from app.main import app
 from app.mesh_builder import generate_mannequin_garment_glb
 from app.s3_service import S3UploadResult
-from app.texture_processor import ATLAS_HEIGHT, ATLAS_WIDTH, build_garment_atlas
+from app.texture_processor import (
+    ATLAS_HEIGHT,
+    ATLAS_WIDTH,
+    build_garment_atlas,
+    build_trousers_atlas_with_meta,
+)
 
 
 def _make_sample_shirt_png(color=(30, 90, 180), label="FRONT") -> bytes:
@@ -168,3 +173,53 @@ def test_api_endpoints_and_mocked_s3():
     )
     assert raw_resp.status_code == 200
     _validate_glb_bytes(raw_resp.content)
+
+
+def _make_sample_trousers_png(color=(40, 60, 100), is_shorts: bool = False) -> bytes:
+    """Create a synthetic flat-lay trousers or shorts image on a white studio background."""
+    h = 420 if is_shorts else 760
+    img = Image.new("RGB", (500, h), (248, 248, 248))
+    draw = ImageDraw.Draw(img)
+    # Waistband & hip block
+    draw.rectangle([130, 60, 370, 210], fill=color)
+    draw.rectangle([130, 60, 370, 88], fill=(28, 42, 72))
+    # Left & right legs with clear gap in between
+    leg_end = 360 if is_shorts else 700
+    draw.polygon([(130, 210), (238, 210), (218, leg_end), (140, leg_end)], fill=color)
+    draw.polygon([(262, 210), (370, 210), (360, leg_end), (282, leg_end)], fill=color)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_trousers_and_shorts_pipeline():
+    pants_front = _make_sample_trousers_png(is_shorts=False)
+    pants_back = _make_sample_trousers_png(is_shorts=False)
+    atlas_png, detected_shorts = build_trousers_atlas_with_meta(pants_front, pants_back)
+    assert detected_shorts is False
+    assert Image.open(io.BytesIO(atlas_png)).size == (ATLAS_WIDTH, ATLAS_HEIGHT)
+
+    shorts_front = _make_sample_trousers_png(is_shorts=True)
+    shorts_back = _make_sample_trousers_png(is_shorts=True)
+    _, detected_shorts_2 = build_trousers_atlas_with_meta(shorts_front, shorts_back)
+    assert detected_shorts_2 is True
+
+    for gender in ("male", "female"):
+        for gtype in ("trousers", "shorts"):
+            glb = generate_mannequin_garment_glb(
+                pants_front, pants_back, garment_type=gtype, mannequin_gender=gender
+            )
+            gltf = _validate_glb_bytes(glb)
+            assert len(gltf["meshes"]) == 2
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/garments/generate-3d/raw",
+        files={
+            "front_image": ("pants_f.png", pants_front, "image/png"),
+            "back_image": ("pants_b.png", pants_back, "image/png"),
+        },
+        data={"garment_type": "trousers", "mannequin_gender": "male"},
+    )
+    assert resp.status_code == 200
+    _validate_glb_bytes(resp.content)

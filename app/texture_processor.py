@@ -765,3 +765,487 @@ def build_garment_atlas(front_bytes: bytes, back_bytes: bytes) -> bytes:
     """Build a 2048x1024 PNG texture atlas combining front (left) and back (right)."""
     png_bytes, _, _ = build_garment_atlas_with_meta(front_bytes, back_bytes)
     return png_bytes
+
+
+@dataclass
+class ExtractedTrousers:
+    """Processed trouser/shorts image with crotch split and aspect metadata."""
+
+    rgba: np.ndarray
+    mask: np.ndarray
+    y_crotch: int
+    split_x: int
+    dominant_color: Tuple[int, int, int]
+    from_human: bool = False
+    is_shorts: bool = False
+
+
+def _segment_worn_trousers_fallback(
+    rgb: np.ndarray,
+    person_mask: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Fallback lower-body garment isolator using SelfieSegmentation + GrabCut."""
+    h, w = rgb.shape[:2]
+    ys_p, _ = np.where(person_mask)
+    if len(ys_p) < h * w * 0.08:
+        return None
+
+    y_top_p = int(ys_p.min())
+    y_bot_p = int(ys_p.max())
+    span_h = max(1, y_bot_p - y_top_p)
+    # If full-body person is visible, pants typically start around 42% down from top
+    y_waist = min(h - 10, y_top_p + int(span_h * 0.42))
+    y_ankle = max(y_waist + 10, y_bot_p - int(span_h * 0.05))
+
+    gc = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    gc[~person_mask] = cv2.GC_BGD
+    gc[:y_waist, :] = cv2.GC_BGD
+    if y_ankle < h:
+        gc[y_ankle:, :] = cv2.GC_BGD
+
+    lower = person_mask.copy()
+    lower[:y_waist, :] = False
+    lower[y_ankle:, :] = False
+    gc[lower] = cv2.GC_PR_FGD
+
+    # Definite foreground in upper-thigh band
+    ys_l, xs_l = np.where(lower)
+    if len(xs_l) < 50:
+        return None
+    cx = int(np.median(xs_l))
+    bw = max(10, int((xs_l.max() - xs_l.min()) * 0.22))
+    cy0 = min(h - 2, y_waist + max(4, int((y_ankle - y_waist) * 0.10)))
+    cy1 = min(h - 1, y_waist + max(8, int((y_ankle - y_waist) * 0.35)))
+    if cy1 > cy0:
+        gc[cy0:cy1, max(0, cx - bw) : min(w, cx + bw)] = cv2.GC_FGD
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    cv2.grabCut(bgr, gc, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+
+    garment_mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    garment_mask = _clean_mask(garment_mask)
+    if np.sum(garment_mask > 0) < h * w * 0.04:
+        return None
+    return garment_mask
+
+
+def _try_segment_worn_trousers(
+    rgb: np.ndarray,
+    expect_human: bool = False,
+) -> Optional[np.ndarray]:
+    """Detect if a human model is wearing trousers/shorts; if so, isolate only the lower garment."""
+    h, w = rgb.shape[:2]
+    pose, seg = _get_mediapipe_models()
+
+    with _MP_LOCK:
+        pose_res = pose.process(rgb)
+        seg_res = seg.process(rgb)
+        person_mask = seg_res.segmentation_mask > 0.45
+
+    if not pose_res.pose_landmarks:
+        return _segment_worn_trousers_fallback(rgb, person_mask) if expect_human else None
+
+    lm = pose_res.pose_landmarks.landmark
+    if min(lm[23].visibility, lm[24].visibility) < 0.30:
+        return _segment_worn_trousers_fallback(rgb, person_mask) if expect_human else None
+
+    y_hip_norm = 0.5 * (lm[23].y + lm[24].y)
+
+    # Confirm knees or ankles or upper body are present so we don't misclassify flat-lay pants
+    has_knees = min(lm[25].visibility, lm[26].visibility) >= 0.30
+    has_ankles = min(lm[27].visibility, lm[28].visibility) >= 0.25
+    has_upper = min(lm[11].visibility, lm[12].visibility) >= 0.30
+    if not expect_human and not (has_knees or has_upper):
+        return None
+
+    y_hip = y_hip_norm * h
+    if has_ankles:
+        y_end = max(y_hip + 20.0, 0.5 * (lm[27].y + lm[28].y) * h)
+    elif has_knees:
+        y_knee = 0.5 * (lm[25].y + lm[26].y) * h
+        y_end = min(float(h), y_hip + 2.05 * max(20.0, y_knee - y_hip))
+    else:
+        ys_p = np.where(person_mask)[0]
+        y_end = float(ys_p.max()) if len(ys_p) else float(h)
+
+    leg_h = max(30.0, y_end - y_hip)
+    # Start right near the hip/waistband; stop just above ankles to exclude shoes
+    y_waist_top = max(0, int(y_hip - 0.08 * leg_h))
+    y_ankle_bot = min(h, int(y_end - (0.02 * leg_h if has_ankles else 0.05 * leg_h)))
+    if y_ankle_bot <= y_waist_top + 20:
+        y_ankle_bot = min(h, int(y_end))
+
+    gc = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    gc[~person_mask] = cv2.GC_BGD
+    gc[:y_waist_top, :] = cv2.GC_BGD
+    if y_ankle_bot < h:
+        gc[y_ankle_bot:, :] = cv2.GC_BGD
+
+    lower_body = person_mask.copy()
+    lower_body[:y_waist_top, :] = False
+    lower_body[y_ankle_bot:, :] = False
+    gc[lower_body] = cv2.GC_PR_FGD
+
+    # Definite foreground along hip->knee and knee->ankle bones
+    x_hip_l = min(lm[23].x, lm[24].x) * w
+    x_hip_r = max(lm[23].x, lm[24].x) * w
+    hip_cx0 = max(0, int(x_hip_l))
+    hip_cx1 = min(w, int(x_hip_r))
+    hip_cy0 = max(0, int(y_hip + 0.02 * leg_h))
+    hip_cy1 = min(h, int(y_hip + 0.16 * leg_h))
+    if hip_cx1 > hip_cx0 and hip_cy1 > hip_cy0:
+        gc[hip_cy0:hip_cy1, hip_cx0:hip_cx1] = cv2.GC_FGD
+
+    for h_i, k_i, a_i in ((23, 25, 27), (24, 26, 28)):
+        if lm[k_i].visibility > 0.35:
+            p_hip = (int(np.clip(lm[h_i].x * w, 0, w - 1)), int(np.clip(lm[h_i].y * h, 0, h - 1)))
+            p_knee = (int(np.clip(lm[k_i].x * w, 0, w - 1)), int(np.clip(lm[k_i].y * h, 0, h - 1)))
+            cv2.line(gc, p_hip, p_knee, int(cv2.GC_FGD), max(6, int(w * 0.035)))
+            if lm[a_i].visibility > 0.35:
+                p_ank = (
+                    int(np.clip(lm[a_i].x * w, 0, w - 1)),
+                    int(np.clip(min(y_ankle_bot - 2, lm[a_i].y * h), 0, h - 1)),
+                )
+                cv2.line(gc, p_knee, p_ank, int(cv2.GC_FGD), max(5, int(w * 0.028)))
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    lab_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    # Sample core trouser color from upper-thigh/pelvis region (guaranteed trouser fabric)
+    sample_y0 = max(0, int(y_hip + 0.10 * leg_h))
+    sample_y1 = min(h, int(y_hip + 0.38 * leg_h))
+    trouser_lab = None
+    if sample_y1 > sample_y0 and hip_cx1 > hip_cx0:
+        core_mask = person_mask[sample_y0:sample_y1, hip_cx0:hip_cx1]
+        if np.sum(core_mask) > 40:
+            trouser_lab = np.median(lab_full[sample_y0:sample_y1, hip_cx0:hip_cx1][core_mask], axis=0)
+
+    # Suppress upper-body shirt, skin/hands, and watches near waistband & pockets
+    if trouser_lab is not None:
+        # Top waistband danger zone: strip shirt/belt pixels that differ strongly from trouser color
+        wb_y0 = max(0, int(y_waist_top - 0.04 * leg_h))
+        wb_y1 = min(h, int(y_hip + 0.12 * leg_h))
+        if wb_y1 > wb_y0:
+            d_trouser_wb = np.linalg.norm(lab_full[wb_y0:wb_y1] - trouser_lab, axis=2)
+            gc[wb_y0:wb_y1][d_trouser_wb > 26.0] = cv2.GC_BGD
+
+        # Bottom ankle/shoe danger zone: strip shoes/socks that differ from trouser color
+        shoe_y0 = max(0, int(y_ankle_bot - 0.08 * leg_h))
+        if y_ankle_bot > shoe_y0:
+            d_trouser_sh = np.linalg.norm(lab_full[shoe_y0:y_ankle_bot] - trouser_lab, axis=2)
+            gc[shoe_y0:y_ankle_bot][d_trouser_sh > 28.0] = cv2.GC_BGD
+
+    # Suppress bare hands/wrists/skin in the upper-half (e.g. hand in pocket + watch)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    skin_ycrcb = (ycrcb[:, :, 1] >= 133) & (ycrcb[:, :, 1] <= 173) & (ycrcb[:, :, 2] >= 77) & (ycrcb[:, :, 2] <= 127)
+    upper_hip_y1 = min(h, int(y_hip + 0.30 * leg_h))
+    gc[:upper_hip_y1][skin_ycrcb[:upper_hip_y1]] = cv2.GC_BGD
+    for wr_i in (15, 16):
+        if lm[wr_i].visibility > 0.30:
+            wx = int(np.clip(lm[wr_i].x * w, 0, w - 1))
+            wy = int(np.clip(lm[wr_i].y * h, 0, h - 1))
+            rw = max(12, int(w * 0.09))
+            wy0, wy1 = max(0, wy - rw), min(h, wy + rw)
+            wx0, wx1 = max(0, wx - rw), min(w, wx + rw)
+            if trouser_lab is not None and wy1 > wy0 and wx1 > wx0:
+                d_wr = np.linalg.norm(lab_full[wy0:wy1, wx0:wx1] - trouser_lab, axis=2)
+                gc[wy0:wy1, wx0:wx1][d_wr > 22.0] = cv2.GC_BGD
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    cv2.grabCut(bgr, gc, None, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_MASK)
+
+    garment_mask = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    garment_mask = _clean_mask(garment_mask)
+
+    # Final color-consistency guard on top 20% and bottom 10% rows to strip any residual shirt/shoe band
+    if trouser_lab is not None and np.sum(garment_mask > 0) > 100:
+        ys_g = np.where(garment_mask > 0)[0]
+        gy0, gy1 = int(ys_g.min()), int(ys_g.max()) + 1
+        gh = max(1, gy1 - gy0)
+        for r in range(gy0, min(gy1, gy0 + int(gh * 0.22))):
+            r_fg = garment_mask[r] > 0
+            if np.sum(r_fg) > 0:
+                d_row = np.linalg.norm(lab_full[r, r_fg] - trouser_lab, axis=1)
+                if float(np.mean(d_row < 30.0)) < 0.55:
+                    garment_mask[r, :] = 0
+        for r in range(max(gy0, gy1 - int(gh * 0.12)), gy1):
+            r_fg = garment_mask[r] > 0
+            if np.sum(r_fg) > 0:
+                d_row = np.linalg.norm(lab_full[r, r_fg] - trouser_lab, axis=1)
+                if float(np.mean(d_row < 30.0)) < 0.55:
+                    garment_mask[r, :] = 0
+        garment_mask = _clean_mask(garment_mask)
+
+    if np.sum(garment_mask > 0) < h * w * 0.04:
+        return _segment_worn_trousers_fallback(rgb, person_mask) if expect_human else None
+    return garment_mask
+
+
+def _find_trouser_crotch_and_split(mask: np.ndarray) -> Tuple[int, int]:
+    """Locate crotch row (where single hip span splits into two leg spans) and center x."""
+    h, w = mask.shape
+    cx = w // 2
+    search_y0 = int(h * 0.16)
+    search_y1 = int(h * 0.68)
+
+    y_crotch = int(h * 0.30)
+    split_xs = []
+    for r in range(search_y0, search_y1):
+        row = mask[r] > 0
+        xs = np.where(row)[0]
+        if len(xs) < 6:
+            continue
+        # Look for an interior background gap between left leg and right leg
+        x_min, x_max = int(xs[0]), int(xs[-1])
+        interior = row[x_min : x_max + 1]
+        bg_idx = np.where(~interior)[0]
+        if len(bg_idx) >= max(3, int((x_max - x_min) * 0.04)):
+            # Confirm gap sits near the horizontal middle
+            mid_gaps = [x_min + int(g) for g in bg_idx if (x_min + (x_max - x_min) * 0.25) <= (x_min + g) <= (x_min + (x_max - x_min) * 0.75)]
+            if len(mid_gaps) >= 2:
+                y_crotch = r
+                split_xs = mid_gaps
+                break
+
+    if split_xs:
+        split_x = int(np.median(split_xs))
+    else:
+        split_x = cx
+    split_x = max(int(w * 0.25), min(int(w * 0.75), split_x))
+    y_crotch = max(int(h * 0.15), min(int(h * 0.58), y_crotch))
+    return y_crotch, split_x
+
+
+def _clean_trouser_disturbances(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Remove non-trouser disturbances (shirts, arms, hands, watches, shoes) from a trouser mask."""
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 100:
+        return mask
+
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    bh = max(1, y1 - y0)
+    bw = max(1, x1 - x0)
+
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+
+    # Sample core trouser color from middle band (38%..72% of bounding height)
+    core_y0 = y0 + int(bh * 0.38)
+    core_y1 = y0 + int(bh * 0.72)
+    core_mask = mask[core_y0:core_y1, x0:x1] > 0
+    if np.sum(core_mask) < 50:
+        core_mask = mask[y0:y1, x0:x1] > 0
+        core_lab_pts = lab[y0:y1, x0:x1][core_mask]
+    else:
+        core_lab_pts = lab[core_y0:core_y1, x0:x1][core_mask]
+
+    trouser_lab = np.median(core_lab_pts, axis=0)
+    # Adaptive threshold: tighter for solid dark/light trousers, tolerant for patterned/denim
+    core_spread = float(np.percentile(np.linalg.norm(core_lab_pts - trouser_lab, axis=1), 85))
+    lab_thresh = float(np.clip(max(24.0, core_spread * 1.65), 24.0, 42.0))
+
+    cleaned = mask.copy()
+
+    # 1. Remove skin-tone pixels (hands, wrists, arms) in upper 60% of garment
+    skin_ycrcb = (
+        (ycrcb[:, :, 1] >= 132)
+        & (ycrcb[:, :, 1] <= 176)
+        & (ycrcb[:, :, 2] >= 75)
+        & (ycrcb[:, :, 2] <= 128)
+    )
+    upper_lim = y0 + int(bh * 0.60)
+    d_lab_all = np.linalg.norm(lab - trouser_lab, axis=2)
+    cleaned[:upper_lim][skin_ycrcb[:upper_lim] & (d_lab_all[:upper_lim] > 16.0)] = 0
+
+    # 2. Strip shirt/cuff/watch pixels in upper 42% that diverge from trouser color
+    top_lim = y0 + int(bh * 0.42)
+    for r in range(y0, min(y1, top_lim)):
+        fg = cleaned[r] > 0
+        if not np.any(fg):
+            continue
+        # Remove pixels that don't match trouser fabric color
+        bad = fg & (d_lab_all[r] > lab_thresh)
+        cleaned[r, bad] = 0
+
+        # If row has very little trouser fabric left (e.g. mostly shirt), clear entire row
+        fg_after = cleaned[r] > 0
+        if np.sum(fg_after) < max(8, int(bw * 0.25)):
+            cleaned[r, :] = 0
+
+    # 3. Remove trapped studio background anywhere in the interior (e.g. gap between legs)
+    interior_thresh = max(32.0, lab_thresh * 1.25)
+    cleaned[d_lab_all > interior_thresh] = 0
+
+    # 4. Trim shoe/sole rows in bottom 12%
+    bot_start = y0 + int(bh * 0.88)
+    for r in range(max(y0, bot_start), y1):
+        fg = cleaned[r] > 0
+        if not np.any(fg):
+            continue
+        # Shoes have higher color variance / specular highlights compared to pant legs
+        row_d = d_lab_all[r, fg]
+        if float(np.mean(row_d < lab_thresh)) < 0.72:
+            cleaned[r, :] = 0
+
+    # 4. Keep only significant connected components (drops detached shirt cuffs / hands)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = int(areas.max()) if len(areas) else 0
+        keep = np.zeros_like(cleaned)
+        for idx, area in enumerate(areas, start=1):
+            if area >= max(100, int(max_area * 0.12)):
+                keep[labels == idx] = 255
+        cleaned = keep
+
+    cleaned = _clean_mask(cleaned)
+    return cleaned if np.sum(cleaned > 0) >= 100 else mask
+
+
+def _extract_trousers(image_bytes: bytes, expect_human: bool = False) -> ExtractedTrousers:
+    """Segment, tight-crop, and analyze a flat-lay or worn trouser/shorts image."""
+    rgba = _load_image_rgba(image_bytes)
+    rgb_full = rgba[:, :, :3]
+
+    worn_mask = None
+    transparent_ratio = float(np.mean(rgba[:, :, 3] < 220))
+    if transparent_ratio <= 0.03:
+        worn_mask = _try_segment_worn_trousers(rgb_full, expect_human=expect_human)
+
+    from_human = worn_mask is not None
+    mask = worn_mask if worn_mask is not None else _segment_garment(rgba)
+    mask = _clean_trouser_disturbances(rgb_full, mask)
+
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        h, w = rgba.shape[:2]
+        x0, y0, x1, y1 = 0, 0, w, h
+        mask = np.full((h, w), 255, dtype=np.uint8)
+    else:
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+
+    cropped_rgba = rgba[y0:y1, x0:x1].copy()
+    cropped_mask = mask[y0:y1, x0:x1].copy()
+
+    erode_px = max(2, min(6, min(cropped_mask.shape) // 90))
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
+    inner_mask = cv2.erode(cropped_mask, erode_kernel, iterations=1)
+    if np.sum(inner_mask > 0) < np.sum(cropped_mask > 0) * 0.5:
+        inner_mask = cropped_mask
+
+    fg_pixels = cropped_rgba[inner_mask > 0][:, :3]
+    if len(fg_pixels) > 0:
+        med = np.median(fg_pixels, axis=0).astype(int)
+        dominant_color = (int(med[0]), int(med[1]), int(med[2]))
+    else:
+        dominant_color = (60, 70, 90)
+
+    filled_rgb = _inpaint_background(cropped_rgba[:, :, :3], inner_mask)
+    filled_rgba = np.dstack([filled_rgb, np.full(cropped_mask.shape, 255, dtype=np.uint8)])
+
+    ch, cw = inner_mask.shape
+    y_crotch, split_x = _find_trouser_crotch_and_split(inner_mask)
+
+    # Measure waist width (top 20% of garment) to distinguish full trousers vs shorts
+    waist_rows = inner_mask[: max(2, int(ch * 0.22)), :]
+    waist_widths = [int(np.where(r > 0)[0][-1] - np.where(r > 0)[0][0] + 1) for r in waist_rows if np.sum(r > 0) > 4]
+    waist_w = float(np.median(waist_widths)) if waist_widths else float(cw)
+    aspect = float(ch / max(1.0, waist_w))
+    is_shorts = aspect < 1.25
+
+    return ExtractedTrousers(
+        rgba=filled_rgba,
+        mask=inner_mask,
+        y_crotch=y_crotch,
+        split_x=split_x,
+        dominant_color=dominant_color,
+        from_human=from_human,
+        is_shorts=is_shorts,
+    )
+
+
+def _resample_region_rows(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    fallback_color: Tuple[int, int, int],
+    target_w: int,
+    target_h: int,
+) -> Image.Image:
+    """Resample each row's foreground span across target_w to eliminate background bleed."""
+    rows_out = []
+    row_widths = [int(np.where(mask[r] > 0)[0][-1] - np.where(mask[r] > 0)[0][0] + 1) for r in range(mask.shape[0]) if np.sum(mask[r] > 0) >= 4]
+    med_w = float(np.median(row_widths)) if row_widths else float(mask.shape[1])
+    min_px = max(6, int(med_w * 0.45))
+
+    for r in range(mask.shape[0]):
+        r_xs = np.where(mask[r] > 0)[0]
+        if len(r_xs) >= min_px:
+            x0 = int(r_xs[0])
+            x1 = int(r_xs[-1]) + 1
+            trim = min(2, max(0, (x1 - x0 - 4) // 2))
+            row_img = Image.fromarray(rgb[r, x0 + trim : x1 - trim][None, :, :], mode="RGB").resize(
+                (target_w, 1), Image.Resampling.BILINEAR
+            )
+            rows_out.append(np.array(row_img)[0])
+
+    if len(rows_out) >= 8:
+        arr = np.stack(rows_out, axis=0)
+        return Image.fromarray(arr, mode="RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+    if rgb.size > 0:
+        return Image.fromarray(rgb, mode="RGB").resize((target_w, target_h), Image.Resampling.LANCZOS)
+    return Image.new("RGB", (target_w, target_h), fallback_color)
+
+
+def _pack_trousers_tile(trousers: ExtractedTrousers, size: int = HALF_SIZE) -> Image.Image:
+    """Pack a single trouser side (front or back) into a standardized square UV tile.
+
+    Layout:
+      - Top band [0 .. hip_h]: waistband + hips across full width
+      - Bottom-left [hip_h .. size, 0 .. size//2]: left leg
+      - Bottom-right [hip_h .. size, size//2 .. size]: right leg
+    """
+    rgb = trousers.rgba[:, :, :3]
+    mask = trousers.mask
+    yc = trousers.y_crotch
+    sx = trousers.split_x
+
+    hip_h = int(size * 0.28)
+    leg_h = size - hip_h
+    half_w = size // 2
+
+    hip_img = _resample_region_rows(rgb[:yc, :], mask[:yc, :], trousers.dominant_color, size, hip_h)
+    left_leg_img = _resample_region_rows(rgb[yc:, :sx], mask[yc:, :sx], trousers.dominant_color, half_w, leg_h)
+    right_leg_img = _resample_region_rows(rgb[yc:, sx:], mask[yc:, sx:], trousers.dominant_color, size - half_w, leg_h)
+
+    tile = Image.new("RGB", (size, size), trousers.dominant_color)
+    tile.paste(hip_img, (0, 0))
+    tile.paste(left_leg_img, (0, hip_h))
+    tile.paste(right_leg_img, (half_w, hip_h))
+    return tile
+
+
+def build_trousers_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tuple[bytes, bool]:
+    """Build a 2048x1024 PNG atlas for trousers/shorts and return (png_bytes, is_shorts)."""
+    front = _extract_trousers(front_bytes)
+    back = _extract_trousers(back_bytes, expect_human=front.from_human)
+    if back.from_human and not front.from_human:
+        front = _extract_trousers(front_bytes, expect_human=True)
+
+    is_shorts = front.is_shorts and back.is_shorts
+    front_tile = _pack_trousers_tile(front, HALF_SIZE)
+    back_tile = _pack_trousers_tile(back, HALF_SIZE)
+
+    atlas = Image.new("RGB", (ATLAS_WIDTH, ATLAS_HEIGHT))
+    atlas.paste(front_tile, (0, 0))
+    atlas.paste(back_tile, (HALF_SIZE, 0))
+
+    out = io.BytesIO()
+    atlas.save(out, format="PNG", optimize=True)
+    return out.getvalue(), is_shorts

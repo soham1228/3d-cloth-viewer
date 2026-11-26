@@ -16,8 +16,15 @@ from app.s3_service import upload_glb_to_s3
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate 3D mannequin .glb from front and back shirt images.")
-    parser.add_argument("--front", required=True, type=Path, help="Path to front shirt/t-shirt image.")
-    parser.add_argument("--back", required=True, type=Path, help="Path to back shirt/t-shirt image.")
+    parser.add_argument("--front", required=True, type=Path, help="Path to front garment image.")
+    parser.add_argument("--back", required=True, type=Path, help="Path to back garment image.")
+    parser.add_argument(
+        "--type",
+        dest="garment_type",
+        default=None,
+        choices=["tshirt", "vneck", "long_sleeve", "shirt", "polo", "trousers", "shorts"],
+        help="Garment type (default: auto-detect upper-body top; pass 'trousers' or 'shorts' for pants).",
+    )
     parser.add_argument(
         "--gender",
         dest="mannequin_gender",
@@ -44,6 +51,7 @@ def main() -> None:
     glb_bytes = generate_mannequin_garment_glb(
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
+        garment_type=args.garment_type,
         mannequin_style=args.mannequin_style,
         mannequin_gender=args.mannequin_gender,
         include_stand=args.with_stand,

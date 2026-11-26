@@ -230,6 +230,18 @@
     </div>
 
     <div class="field">
+      <label for="garmentType">Garment Type</label>
+      <select id="garmentType">
+        <option value="">Top / Shirt (Auto-detect)</option>
+        <option value="trousers">Trousers / Pants</option>
+        <option value="shorts">Shorts</option>
+        <option value="tshirt">T-Shirt</option>
+        <option value="long_sleeve">Long Sleeve</option>
+        <option value="shirt">Shirt / Polo</option>
+      </select>
+    </div>
+
+    <div class="field">
       <label for="mannequinGender">Mannequin</label>
       <select id="mannequinGender">
         <option value="male">Men (Male Mannequin)</option>
@@ -369,6 +381,8 @@
         const form = new FormData();
         form.append("front_image", frontFile);
         form.append("back_image", backFile);
+        const gtype = document.getElementById("garmentType").value;
+        if (gtype) form.append("garment_type", gtype);
         form.append("mannequin_gender", document.getElementById("mannequinGender").value);
         form.append("mannequin_style", document.getElementById("mannequinStyle").value);
         form.append("upload_to_s3", uploadS3Checkbox.checked ? "true" : "false");

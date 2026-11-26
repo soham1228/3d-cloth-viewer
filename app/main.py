@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from app.config import settings
-from app.mesh_builder import MannequinGender, MannequinStyle, generate_mannequin_garment_glb
+from app.mesh_builder import GarmentType, MannequinGender, MannequinStyle, generate_mannequin_garment_glb
 from app.s3_service import is_s3_configured, upload_glb_to_s3
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -88,13 +88,14 @@ async def generate_3d_garment(
     front_image_url: Optional[str] = Form(default=None),
     back_image_url: Optional[str] = Form(default=None),
     product_id: Optional[str] = Form(default=None),
+    garment_type: Optional[GarmentType] = Form(default=None),
     mannequin_gender: MannequinGender = Form(default="male"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
     include_stand: bool = Form(default=False),
     upload_to_s3: Optional[bool] = Form(default=None),
     save_local: bool = Form(default=True),
 ):
-    """Generate a 3D mannequin .glb wearing the uploaded front & back shirt images."""
+    """Generate a 3D mannequin .glb wearing the uploaded front & back garment images."""
     if front_image is not None:
         front_bytes = await front_image.read()
     elif front_image_url:
@@ -113,6 +114,7 @@ async def generate_3d_garment(
         glb_bytes = generate_mannequin_garment_glb(
             front_image_bytes=front_bytes,
             back_image_bytes=back_bytes,
+            garment_type=garment_type,
             mannequin_style=mannequin_style,
             mannequin_gender=mannequin_gender,
             include_stand=include_stand,
@@ -164,6 +166,7 @@ async def generate_3d_garment(
 async def generate_3d_garment_raw(
     front_image: UploadFile = File(...),
     back_image: UploadFile = File(...),
+    garment_type: Optional[GarmentType] = Form(default=None),
     mannequin_gender: MannequinGender = Form(default="male"),
     mannequin_style: MannequinStyle = Form(default="studio_charcoal"),
     include_stand: bool = Form(default=False),
@@ -174,6 +177,7 @@ async def generate_3d_garment_raw(
     glb_bytes = generate_mannequin_garment_glb(
         front_image_bytes=front_bytes,
         back_image_bytes=back_bytes,
+        garment_type=garment_type,
         mannequin_style=mannequin_style,
         mannequin_gender=mannequin_gender,
         include_stand=include_stand,
