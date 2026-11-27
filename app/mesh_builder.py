@@ -303,6 +303,29 @@ def _triangulate_grid(
     )
 
 
+def _weld_seam_normals(prim: MeshPrimitiveData, grid_step: float = 1e-4) -> MeshPrimitiveData:
+    """Average vertex normals ONLY for genuinely coincident seam vertices (never interior grid vertices)."""
+    keys = np.round(prim.positions / grid_step).astype(np.int64)
+    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    # Only weld vertices that actually share a position with another vertex
+    shared_mask = counts[inv] > 1
+    if not np.any(shared_mask):
+        return prim
+    summed = np.zeros_like(prim.normals)
+    np.add.at(summed, inv, prim.normals)
+    lengths = np.linalg.norm(summed, axis=1, keepdims=True)
+    lengths = np.where(lengths < 1e-8, 1.0, lengths)
+    welded = np.where(shared_mask[:, None], summed / lengths, prim.normals).astype(np.float32)
+    return MeshPrimitiveData(
+        name=prim.name,
+        positions=prim.positions,
+        normals=welded,
+        uvs=prim.uvs,
+        indices=prim.indices,
+        material_index=prim.material_index,
+    )
+
+
 def _merge_primitives(parts: List[MeshPrimitiveData], name: str, material_index: int) -> MeshPrimitiveData:
     """Combine multiple primitives sharing a material into one draw call."""
     pos_list, nrm_list, uv_list, idx_list = [], [], [], []
@@ -775,21 +798,21 @@ def _build_lower_mannequin_body(
 ) -> MeshPrimitiveData:
     """Build sculpted lower-body mannequin (waist, pelvis, and two legs) for trousers/shorts."""
     is_fem = gender == "female"
-    y_knots = np.array([0.14, 0.22, 0.30, 0.38, 0.44, 0.50])
+    y_knots = np.array([0.19, 0.24, 0.30, 0.38, 0.44, 0.50])
     rx_vals = (
         np.array([0.148, 0.172, 0.166, 0.126, 0.120, 0.124])
         if is_fem
         else np.array([0.144, 0.160, 0.158, 0.144, 0.142, 0.144])
     )
     rf_vals = (
-        np.array([0.090, 0.104, 0.100, 0.080, 0.078, 0.080])
+        np.array([0.072, 0.100, 0.100, 0.080, 0.078, 0.080])
         if is_fem
-        else np.array([0.088, 0.098, 0.096, 0.090, 0.089, 0.090])
+        else np.array([0.070, 0.095, 0.096, 0.090, 0.089, 0.090])
     )
     rb_vals = (
-        np.array([0.100, 0.114, 0.106, 0.082, 0.079, 0.080])
+        np.array([0.078, 0.110, 0.106, 0.082, 0.079, 0.080])
         if is_fem
-        else np.array([0.092, 0.102, 0.098, 0.089, 0.088, 0.089])
+        else np.array([0.074, 0.098, 0.098, 0.089, 0.088, 0.089])
     )
 
     rx_sp = PchipInterpolator(y_knots, rx_vals, extrapolate=True)
@@ -798,7 +821,7 @@ def _build_lower_mannequin_body(
 
     ntheta = 64
     thetas = np.linspace(0.0, 2.0 * np.pi, ntheta, endpoint=False)
-    ys_pelvis = np.linspace(0.14, 0.50, 24)
+    ys_pelvis = np.linspace(0.19, 0.50, 22)
     ny = len(ys_pelvis)
     grid = np.zeros((ny, ntheta, 3), dtype=np.float32)
     uvs = np.zeros((ny, ntheta, 2), dtype=np.float32)
@@ -818,7 +841,7 @@ def _build_lower_mannequin_body(
 
     pelvis_prim = _triangulate_grid(grid, uvs, material_index, "mannequin_pelvis", wrap_col=True)
     top_cap = _build_cap_disk(grid[-1], np.array([0.0, 0.506, 0.0]), reverse=False, material_index=material_index)
-    bot_cap = _build_cap_disk(grid[0], np.array([0.0, 0.136, 0.0]), reverse=True, material_index=material_index)
+    bot_cap = _build_cap_disk(grid[0], np.array([0.0, 0.192, 0.0]), reverse=True, material_index=material_index)
     parts = [pelvis_prim, top_cap, bot_cap]
 
     # Left & right mannequin legs
@@ -927,6 +950,24 @@ def _build_trousers_mesh(
             )
         )
 
+    # Crotch saddle bridge connecting front crotch edge to back crotch edge (tucked slightly inside)
+    nx_sad = 24
+    nz_sad = 10
+    xs_sad = np.linspace(-x_leg_0, x_leg_0, nx_sad)
+    s_sad = np.linspace(0.0, 1.0, nz_sad)
+    sad_grid = np.zeros((nz_sad, nx_sad, 3), dtype=np.float32)
+    sad_uvs = np.zeros((nz_sad, nx_sad, 2), dtype=np.float32)
+    z_edge = np.sqrt(np.maximum(0.0, r_thigh ** 2 - (np.abs(xs_sad) - x_leg_0) ** 2))
+    for iz, sv in enumerate(s_sad):
+        z_row = (1.0 - 2.0 * sv) * z_edge
+        y_row = 0.162 + 0.004 * np.sin(np.pi * sv) * (1.0 - (xs_sad / x_leg_0) ** 2)
+        sad_grid[iz, :, 0] = xs_sad
+        sad_grid[iz, :, 1] = y_row
+        sad_grid[iz, :, 2] = z_row
+        sad_uvs[iz, :, 0] = 0.25 + 0.02 * (xs_sad / x_leg_0)
+        sad_uvs[iz, :, 1] = 0.34
+    saddle_prim = _triangulate_grid(sad_grid, sad_uvs, material_index, "trousers_crotch_saddle", wrap_col=False)
+
     # 2. Left & right leg tubes starting seamlessly at y=0.16
     y_leg_top = 0.16
     y_leg_bot = -0.04 if is_shorts else -0.50
@@ -939,15 +980,18 @@ def _build_trousers_mesh(
     for side in (-1.0, 1.0):
         x_center = side * (x_leg_0 + 0.010 * depth_frac)
         z_center = 0.005 * np.sin(np.pi * depth_frac) - 0.006 * (depth_frac ** 2)
-        r_knee = 0.072
-        r_hem = 0.064
+        r_knee = 0.078
+        r_hem = 0.070
         radii = np.interp(depth_frac, [0.0, 0.48, 1.0], [r_thigh, r_knee, r_hem])
 
         for is_front in (True, False):
             # Front tile: u in [0.0, 0.5]; Back tile: u in [0.5, 1.0]
-            # Left leg (side=-1) occupies left half of tile; Right leg (side=+1) occupies right half
-            tile_base = 0.0 if is_front else 0.5
-            leg_u0 = tile_base + (0.0 if side < 0 else 0.25)
+            # On front (-X is left, +X is right): side=-1 -> [0.0, 0.25], side=+1 -> [0.25, 0.5]
+            # On back (+X is viewer-left, -X is viewer-right): side=+1 -> [0.5, 0.75], side=-1 -> [0.75, 1.0]
+            if is_front:
+                leg_u0 = 0.0 if side < 0 else 0.25
+            else:
+                leg_u0 = 0.75 if side < 0 else 0.50
             leg_u1 = leg_u0 + 0.25
 
             thetas = np.linspace(np.pi, 0.0, nx_leg) if is_front else np.linspace(0.0, -np.pi, nx_leg)
@@ -974,7 +1018,8 @@ def _build_trousers_mesh(
                 )
             )
 
-    return _merge_primitives(parts, name="Garment", material_index=material_index)
+    shell_merged = _weld_seam_normals(_merge_primitives(parts, name="Garment", material_index=material_index))
+    return _merge_primitives([shell_merged, saddle_prim], name="Garment", material_index=material_index)
 
 
 def generate_mannequin_garment_glb(

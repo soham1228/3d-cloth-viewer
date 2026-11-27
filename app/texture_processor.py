@@ -1220,7 +1220,8 @@ def _pack_trousers_tile(trousers: ExtractedTrousers, size: int = HALF_SIZE) -> I
     leg_h = size - hip_h
     half_w = size // 2
 
-    hip_img = _resample_region_rows(rgb[:yc, :], mask[:yc, :], trousers.dominant_color, size, hip_h)
+    hip_end = max(4, yc - 3)
+    hip_img = _resample_region_rows(rgb[:hip_end, :], mask[:hip_end, :], trousers.dominant_color, size, hip_h)
     left_leg_img = _resample_region_rows(rgb[yc:, :sx], mask[yc:, :sx], trousers.dominant_color, half_w, leg_h)
     right_leg_img = _resample_region_rows(rgb[yc:, sx:], mask[yc:, sx:], trousers.dominant_color, size - half_w, leg_h)
 
@@ -1241,6 +1242,15 @@ def build_trousers_atlas_with_meta(front_bytes: bytes, back_bytes: bytes) -> Tup
     is_shorts = front.is_shorts and back.is_shorts
     front_tile = _pack_trousers_tile(front, HALF_SIZE)
     back_tile = _pack_trousers_tile(back, HALF_SIZE)
+
+    # Harmonize back exposure/brightness to match front so side seams blend naturally
+    f_arr = np.array(front_tile, dtype=np.float32)
+    b_arr = np.array(back_tile, dtype=np.float32)
+    f_mean = float(np.mean(f_arr))
+    b_mean = max(1.0, float(np.mean(b_arr)))
+    gain = float(np.clip(f_mean / b_mean, 0.80, 1.25))
+    b_arr = np.clip(b_arr * gain, 0, 255).astype(np.uint8)
+    back_tile = Image.fromarray(b_arr, mode="RGB")
 
     atlas = Image.new("RGB", (ATLAS_WIDTH, ATLAS_HEIGHT))
     atlas.paste(front_tile, (0, 0))
